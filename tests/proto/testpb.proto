@@ -1,0 +1,76 @@
+// 仅供本仓库测试使用的示例消息，覆盖表注册、缓存和 CRUD 等场景。
+// 建表元数据使用 proto/proto2mysql_option.proto 中的选项定义。
+syntax = "proto3";
+
+import "proto2mysql_option.proto";
+
+option go_package = "github.com/luyuancpp/proto2mysql/internal/testpb;testpb";
+
+option (proto2mysql.db) = true;
+
+message player {
+  uint64 player_id = 1;
+  string name = 2;
+}
+
+message golang_test {
+  option (proto2mysql.table_name)         = "golang_test";
+  option (proto2mysql.primary_key)        = "id";
+  option (proto2mysql.auto_increment_key) = "id";
+
+  uint32 id = 1;
+  string ip = 2;
+  uint32 port = 3;
+  uint32 group_id = 4;
+  player player = 5;
+  uint64 player_id = 6;
+}
+
+message golang_test_list {
+  repeated golang_test test_list = 1;
+}
+
+// 新增表1：结构类似，增加一个额外字段
+message golang_test1 {
+  option (proto2mysql.table_name)         = "golang_test1";
+  option (proto2mysql.primary_key)        = "id";
+  option (proto2mysql.auto_increment_key) = "id";
+
+  uint32 id = 1;
+  string ip = 2;
+  uint32 port = 3;
+  uint32 group_id = 4;
+  player player = 5;
+  uint64 player_id = 6;
+  string extra_info = 7;
+}
+
+// 新增表2：结构类似，port 改为 uint64
+message golang_test2 {
+  option (proto2mysql.table_name)         = "golang_test2";
+  option (proto2mysql.primary_key)        = "id";
+  option (proto2mysql.auto_increment_key) = "id";
+
+  uint32 id = 1;
+  string ip = 2;
+  uint64 port = 3;
+  uint32 group_id = 4;
+  player player = 5;
+  uint64 player_id = 6;
+  string extra_info = 7;
+}
+
+// 新增表3：结构类似，增加嵌套 player 字段
+message golang_test3 {
+  option (proto2mysql.table_name)         = "golang_test3";
+  option (proto2mysql.primary_key)        = "id";
+  option (proto2mysql.auto_increment_key) = "id";
+
+  uint32 id = 1;
+  string ip = 2;
+  uint32 port = 3;
+  uint32 group_id = 4;
+  player player = 5;
+  uint64 player_id = 6;
+  player extra_player = 7;
+}

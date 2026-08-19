@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 测试时现场生成的 protobuf stub（不进版本库：生成器版本一变就和源 proto 静默漂移）
+tests/gen/
+
+# 本地产物
+*.sql
+!tests/**/*.sql

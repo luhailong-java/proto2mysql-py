@@ -1,0 +1,95 @@
+// 覆盖全部受支持字段类型的样本表，用于类型映射 / 值转换 / 建表 DDL 的测试。
+syntax = "proto3";
+
+package kitchen;
+
+import "proto2mysql_option.proto";
+import "google/protobuf/timestamp.proto";
+
+option (proto2mysql.db) = true;
+
+enum grade {
+  GRADE_UNSPECIFIED = 0;
+  GRADE_GOLD = 1;
+}
+
+message kitchen_sink {
+  option (proto2mysql.table_name)         = "kitchen_sink";
+  option (proto2mysql.primary_key)        = "id";
+  option (proto2mysql.auto_increment_key) = "id";
+  option (proto2mysql.index)              = "name;zone_id,created_at";
+  option (proto2mysql.unique_key)         = "name,zone_id";
+
+  int64  id       = 1;
+  string name     = 2;
+  int32  zone_id  = 3 [(proto2mysql.nullable) = true];
+  uint32 u32      = 4;
+  uint64 u64      = 5;
+  float  f32      = 6;
+  double f64      = 7;
+  bool   flag     = 8;
+  bytes  payload  = 9;
+  grade  tier     = 10;
+  google.protobuf.Timestamp created_at = 11;
+  repeated int64 tags = 12;
+  map<string, int32> attrs = 13;
+  optional int32 opt_score = 14;
+  nested sub = 15;
+}
+
+message nested {
+  int64 a = 1;
+  string b = 2;
+}
+
+// 联合主键 + 无自增，用来测 primary_key_where / delete_by_pk_in 的报错路径
+message combo_key {
+  option (proto2mysql.table_name)  = "combo_key";
+  option (proto2mysql.primary_key) = "user_id,provider";
+
+  uint64 user_id  = 1;
+  string provider = 2;
+  int64  score    = 3;
+}
+
+// 列名与 MySQL 关键字冲突：建表/迁移时应告警（但不改写列名，改写会让列对不上）
+message keyword_col {
+  option (proto2mysql.table_name)  = "keyword_col";
+  option (proto2mysql.primary_key) = "id";
+
+  int64  id   = 1;
+  string key  = 2;
+  string text = 3;
+}
+
+// 同一张表的两个版本：字段 2 改了名字，字段号不变。
+// 用来在真库上验证"按字段号 CHANGE COLUMN 改名、原有数据保留"。
+message rename_before {
+  option (proto2mysql.table_name)  = "rename_demo";
+  option (proto2mysql.primary_key) = "id";
+
+  int64  id       = 1;
+  string old_name = 2;
+  int64  score    = 3;
+}
+
+message rename_after {
+  option (proto2mysql.table_name)  = "rename_demo";
+  option (proto2mysql.primary_key) = "id";
+
+  int64  id       = 1;
+  string new_name = 2;   // 与 rename_before.old_name 同为字段号 2
+  int64  score    = 3;
+  int64  added    = 4;   // 顺便验证新增列
+}
+
+// 声明顺序 ≠ 字段号顺序：列顺序必须跟**声明顺序**走。
+// 用 ListFields() 的顺序（字段号升序）会让整行错列写进消息，而且不报错。
+message order_demo {
+  option (proto2mysql.table_name)  = "order_demo";
+  option (proto2mysql.primary_key) = "id";
+
+  int64  id = 10;
+  string a  = 3;
+  int64  b  = 1;
+}

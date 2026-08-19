@@ -1,0 +1,10 @@
+# 全仓文本一律以 LF 存储与检出。
+#
+# 不这么钉的话：Windows 上 core.autocrlf=true 的开发者检出会拿到 CRLF，
+# Linux/CI 上是 LF，于是"没改内容的文件"也会整篇出现在 diff 里。
+* text=auto eol=lf
+
+# 二进制别碰
+*.png binary
+*.jpg binary
+*.pb  binary

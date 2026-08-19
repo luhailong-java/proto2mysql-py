@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+import "proto2mysql_option.proto";
+
+option (proto2mysql.db) = true;
+
+// account 用于测试：带主键/自增/索引/唯一键选项。
+message account {
+  option (proto2mysql.table_name)         = "account";
+  option (proto2mysql.primary_key)        = "id";
+  option (proto2mysql.auto_increment_key) = "id";
+  option (proto2mysql.index)              = "name";
+  option (proto2mysql.unique_key)         = "email";
+
+  uint64 id    = 1;
+  string name  = 2;
+  string email = 3;
+  int32  level = 4;
+  bool   vip   = 5;
+}
+
+// plain 不带表选项，应被忽略。
+message plain {
+  uint32 x = 1;
+}

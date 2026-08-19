@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "proto2mysql"
+version = "0.1.0"
+description = "把 Protobuf 消息自动映射成 MySQL 表结构，并提供参数化的 CRUD / SQL 生成（Go 版 proto2mysql 的 Python 实现）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["protobuf", "mysql", "orm", "sql", "codegen"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Database",
+]
+
+dependencies = [
+    # 描述符反射 + wire 编解码全靠它；5.29 起 FieldDescriptor 有 is_repeated/has_presence，
+    # 而 7.x 移除了 label —— 本库只用前者，两边都能跑。
+    "protobuf>=5.29",
+]
+
+[project.optional-dependencies]
+# 运行期 CRUD 需要一个 MySQL 驱动。库本身不绑定驱动：db.DB 只要一个
+# DB-API 2.0 的 connection，PyMySQL / mysqlclient / SQLAlchemy 的 raw connection 都行。
+mysql = ["PyMySQL>=1.1"]
+sqlalchemy = ["SQLAlchemy>=2.0"]
+dev = [
+    "pytest>=8.3",
+    "grpcio-tools>=1.71",  # 只用来在测试里现场生成 _pb2
+    "PyMySQL>=1.1",
+]
+
+[project.scripts]
+proto2sql = "proto2mysql.tools.proto2sql:main"
+
+[project.urls]
+Homepage = "https://github.com/luyuancpp/proto2mysql-py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/proto2mysql"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "tests/", "README.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# 测试里要现场生成 _pb2 并 import，路径由 conftest 处理
+filterwarnings = ["error::UserWarning"]

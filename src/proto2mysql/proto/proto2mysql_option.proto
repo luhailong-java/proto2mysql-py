@@ -1,0 +1,53 @@
+// proto2mysql 自带的建表选项定义。
+//
+// 用法：在你的 .proto 里 import 本文件，然后在 message / field 上声明表配置，
+// 运行时 RegisterTable 会自动读取，无需在 Go 代码里传 TableOption：
+//
+//	import "proto2mysql_option.proto";
+//
+//	option (proto2mysql.db) = true;   // 文件级标识：本文件用于 proto2mysql 建表
+//
+//	message user {
+//	  option (proto2mysql.table_name)         = "user";
+//	  option (proto2mysql.primary_key)        = "id";           // 逗号分隔 = 联合主键
+//	  option (proto2mysql.auto_increment_key) = "id";
+//	  option (proto2mysql.index)              = "last_login";   // 分号分隔多个索引；索引内逗号分隔 = 联合索引
+//	  option (proto2mysql.unique_key)         = "email";        // 逗号分隔 = 联合唯一键
+//
+//	  uint64 id = 1;
+//	  string email = 2;
+//	  string display_name = 3 [(proto2mysql.nullable) = true];  // 该列允许为 NULL
+//	  uint64 last_login = 4;
+//	}
+syntax = "proto3";
+
+package proto2mysql;
+
+import "google/protobuf/descriptor.proto";
+
+option go_package = "github.com/luyuancpp/proto2mysql/pbopt;pbopt";
+
+extend google.protobuf.FileOptions {
+  // 标记本 .proto 文件用于 proto2mysql 建表，纯用途声明。
+  // 注意：是否建表只取决于各 message 是否声明了 table_name；本选项不影响建表行为。
+  optional bool db = 500000;
+}
+
+extend google.protobuf.MessageOptions {
+  // 表名（必填：声明了才视为一张表）
+  optional string table_name = 500001;
+  // 主键，逗号分隔 = 联合主键，如 "user_id,provider"
+  optional string primary_key = 500002;
+  // 自增字段名
+  optional string auto_increment_key = 500006;
+  // 普通索引：分号分隔多个索引，每个索引内逗号分隔 = 联合索引
+  // 如 "player_id;zone_id,created_at"
+  optional string index = 500011;
+  // 唯一键，逗号分隔 = 联合唯一键，如 "provider,provider_id"
+  optional string unique_key = 500012;
+}
+
+extend google.protobuf.FieldOptions {
+  // 该字段对应的列允许为 NULL（默认 NOT NULL）
+  optional bool nullable = 600100;
+}
