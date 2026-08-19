@@ -37,7 +37,8 @@ dev = [
 proto2sql = "proto2mysql.tools.proto2sql:main"
 
 [project.urls]
-Homepage = "https://github.com/luyuancpp/proto2mysql-py"
+Homepage = "https://github.com/luhailong-java/proto2mysql-py"
+"Go 版（本库移植自它）" = "https://github.com/luyuancpp/proto2mysql"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/proto2mysql"]
