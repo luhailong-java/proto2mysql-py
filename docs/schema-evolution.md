@@ -215,10 +215,57 @@ UPDATE `player` SET `name` = ?, `gold` = ? WHERE `id` = ?
 
 确实需要收窄（比如为了省空间）？请人工写 `ALTER`，库不替你做这个决定。
 
+上面那张表讲的是**列名对得上**的情形——那种情况下库什么都不发，数据原地不动。
+**改名**是另一回事：它必须发一条 `CHANGE COLUMN`，而 MySQL 会借着这条语句
+把整列数据真的搬到新类型上。所以改名问的方向**恰好相反**——不是"线上装不装得下目标"，
+而是"**目标**装不装得下线上"：
+
+做法是「**换类型本体、留目标属性**」：目标比线上窄时，`CHANGE COLUMN` 里写的是
+**线上那个更宽的类型本体**，而 `NOT NULL` / `DEFAULT` / `AUTO_INCREMENT` 这些属性
+仍然来自 proto（`COLUMN_TYPE` 里根本没有它们）。改名照常发生，数据一个字节不动。
+
+| 线上是（旧列名） | proto 要（新列名） | CHANGE COLUMN 里写的类型 |
+|---|---|---|
+| `int unsigned` | `bigint unsigned NOT NULL DEFAULT 0` | `bigint unsigned NOT NULL DEFAULT 0`（拓宽） |
+| `bigint unsigned` | `int unsigned NOT NULL DEFAULT 0` | `bigint unsigned NOT NULL DEFAULT 0`（**不收窄**） |
+| `varchar(64)` | `MEDIUMTEXT` | `MEDIUMTEXT`（拓宽） |
+| `mediumtext` | `varchar(255)` | `mediumtext`（**不收窄**） |
+
+早先改名这条路**只判同族、不判方向**：同一个 proto 改动，顺手改个名，
+就从"什么都不做"变成把 5000000000 静默截成 4294967295（非严格模式），
+或者整条 ALTER 失败让服务起不来（严格模式）。
+
+同一套判断还盖住另外两条会顺手收窄的路：**回填 `pb:N` 注释**
+（类型本来兼容、只是注释缺了）和**补属性**（线上丢了 AUTO_INCREMENT）——
+它们都是"因为别的原因"要发 MODIFY 的场合，早先都会带着 proto 的窄类型一起下去。
+
+### 闸 2.5：属性漂移（NULL / DEFAULT / AUTO_INCREMENT）
+
+`COLUMN_TYPE` 里**看不出**这三样——`int unsigned` 这个字符串既不告诉你可空不可空，
+也不告诉你有没有 AUTO_INCREMENT。所以只比类型串的话，下面这些漂移是完全隐形的。
+
+| 漂移 | 行为 | 为什么 |
+|---|---|---|
+| 线上丢了 `AUTO_INCREMENT` | **自动 MODIFY 补回来** | 不带主键值的 insert 会全写 0，第二条就撞 1062 |
+| 线上 `NOT NULL`、proto 要可空 | **自动 MODIFY 放宽** | 无损。Timestamp 列必然是这一类，线上被改成 NOT NULL 后没赋值该字段的行全部插不进去 |
+| 线上可空、proto 要 `NOT NULL` | 只告警不改 | 线上很可能已经有 NULL 行：严格模式整条 ALTER 失败，非严格模式把 NULL 静默改成 0 |
+| `DEFAULT` 不一致 | 只告警不改 | 默认值只影响不点名该列的 INSERT，改它要重写表定义，收益远小于风险 |
+| 线上是 `TIMESTAMP`、proto 映射 `DATETIME` | **fail-closed** | 自动改是一次全表重建 + 时区语义翻面；TIMESTAMP 按 UTC 存、按会话时区取，上限只到 2038-01-19。错误会要求先核对 `@@session.time_zone`，人工回填并执行 ALTER |
+
+### 闸 2.6：索引漂移
+
+索引比对**不只比名字**：唯一性、列、列序、前缀长度都比。
+最要命的形态是「线上有个同名的**非唯一**索引」——只比名字的话会被判成
+"唯一键已经有了、无需补"，而唯一约束事实上根本不存在，业务却正按"有唯一键"在写。
+
+本库仍然**只加不删**（线上那个索引可能是 DBA 按查询模式手工建的），
+所以漂移时不动它，并会带完整签名 **fail-closed 抛错**，阻止服务在缺失唯一约束或
+错误查询索引的结构上继续启动。要对齐请人工 `DROP INDEX` 后重跑。
+
 ### 闸 3：字段号复用直接拒绝（无需配置，无法关闭）
 
-线上那列的类型与新字段**跨族**（如 `mediumtext` vs `bigint`）时，
-库判定这不是改名而是字段号被复用了，直接报错：
+线上那列的类型与新字段**跨族**（如 `mediumtext` vs `bigint`），或者同族但值域
+发生不安全翻面（如 unsigned → signed）时，库判定这不能作为安全改名，直接报错：
 
 ```
 FieldNumberReusedError: 表 player 的列 legacy_note（mediumtext，pb:4）与新字段
@@ -253,6 +300,16 @@ db.dump_migration_sql_file("migrations/0007_add_addr.sql", pb.Player, pb.Guild)
 
 你依然不用手写迁移脚本（脚本是**生成**的），但拿回了三样东西：
 **唯一执行者、可控时机、出错时能在发布前拦下来**。
+
+`generate_migration_sql()` 与启动时自动同步走的是**同一份差异计算**
+（`_plan_schema_changes`），所以生成的 SQL 就是自动同步会发的那几条：
+列对齐、补索引、补主键都在里面。所有普通 ADD/CHANGE 先落地，任何依赖新列名的索引
+与 `ADD PRIMARY KEY` 放到第二阶段；只有 `AUTO_INCREMENT` 列子句必须与主键同句
+（否则 MySQL Error 1075，而且 TiDB 上这条仍可能单独失败）。所以返回值可能是
+**两条**以换行分隔的语句。
+
+> 早先这两条路径各算各的，离线那条只算了列——库里缺唯一键、缺主键时它返回**空串**，
+> 而空串的意思是"无需迁移"。审核者拿着空的迁移文件签字，缺的约束就这么上线了。
 
 ### 如果你就是要在启动时自动同步
 

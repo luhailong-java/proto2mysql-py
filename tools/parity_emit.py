@@ -28,7 +28,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / "tests" / "gen"))
+sys.path.insert(0, str(ROOT / "tests"))  # 为了 import 生成器本体
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# 干净检出里没有 tests/gen —— 它被 .gitignore 掉了，平时只有 pytest 的 conftest
+# 会现场生成。但对拍链是**刻意可以脱离 pytest 跑**的（parity_run.py 就这么跑，
+# docs/testing.md 的分步命令也是），所以这里必须自己补一次，
+# 否则 fresh clone 上的第一条命令就是 ModuleNotFoundError: testpb_pb2。
+from _gen_stubs import ensure_stubs  # noqa: E402
+from _stdio import force_utf8_stdio  # noqa: E402
+
+ensure_stubs()
 
 import testpb_pb2 as testpb  # noqa: E402
 
@@ -234,6 +244,8 @@ def build_corpus() -> dict:
 
 
 def main(argv=None) -> int:
+    # --help 里就有中文，必须先于 argparse 的任何输出切换编码。
+    force_utf8_stdio()
     ap = argparse.ArgumentParser(description="发射跨语言对拍语料（Python 侧）")
     ap.add_argument("-o", "--output", required=True, help="输出的 JSON 文件")
     args = ap.parse_args(argv)

@@ -76,10 +76,11 @@ class CacheMissError(Proto2MySQLError):
 
 
 class FieldNumberReusedError(Proto2MySQLError):
-    """线上某列的 pb:N 与新字段号相同，但两者类型跨族不可转换。
+    """线上某列的 pb:N 与新字段号相同，但类型跨族或值域变化不安全。
 
     这不是改名，是**字段号被复用**：proto 里删掉一个字段后，把它的编号让给了
-    一个类型完全不同的新字段。库按字段号识别列，于是会生成
+    一个类型完全不同、或 signed/unsigned 值域不兼容的新字段。库按字段号识别列，
+    若继续自动改名就会生成
     ``CHANGE COLUMN legacy foo bigint``——MySQL 的隐式类型转换会把 mediumtext
     里的内容整列吃掉，而本库「永不 DROP COLUMN」的保护在这里帮不上忙。
 

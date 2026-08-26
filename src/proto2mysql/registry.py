@@ -34,6 +34,26 @@ from typing import Iterable, Iterator
 from google.protobuf.descriptor import Descriptor, FileDescriptor
 
 
+def _module_descriptor(mod: object):
+    """取模块的 ``DESCRIPTOR``——**不能用 getattr**。
+
+    PEP 562 允许模块定义 ``__getattr__``，很多库拿它做惰性导入。
+    ``getattr(mod, "DESCRIPTOR", None)`` 只吞 AttributeError：那个钩子抛别的
+    （可选依赖没装时的 ImportError 是最常见的形态）就会直接穿透，把整轮遍历打断——
+    而 register_all_tables 在启动路径上，肇事模块跟 proto 毫无关系。
+
+    生成的 ``_pb2.py`` 里 DESCRIPTOR 一定是真正的模块全局，走 ``__dict__``
+    一个都不会漏。调用方显式点名传进来的可以不是真 module（测试替身 / 惰性代理），
+    那条路保留 getattr 语义，但同样不让它掀翻遍历。
+    """
+    if isinstance(mod, ModuleType):
+        return mod.__dict__.get("DESCRIPTOR")
+    try:
+        return getattr(mod, "DESCRIPTOR", None)
+    except Exception:  # noqa: BLE001 - 代理对象的 __getattr__ 可能抛任何东西
+        return None
+
+
 def iter_file_descriptors(
     modules: Iterable[ModuleType] | None = None,
 ) -> Iterator[FileDescriptor]:
@@ -45,7 +65,7 @@ def iter_file_descriptors(
     seen: set[str] = set()
     source = list(modules) if modules is not None else list(sys.modules.values())
     for mod in source:
-        descriptor = getattr(mod, "DESCRIPTOR", None)
+        descriptor = _module_descriptor(mod)
         if not isinstance(descriptor, FileDescriptor):
             continue
         if descriptor.name in seen:

@@ -14,11 +14,14 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Callable, Iterable
 
 from google.protobuf.descriptor import Descriptor, FieldDescriptor, FileDescriptor
 
 from . import _wire
+
+log = logging.getLogger("proto2mysql")
 
 if TYPE_CHECKING:  # pragma: no cover - 仅为类型标注，运行期不 import（避免循环依赖）
     from .table import MessageTable
@@ -71,7 +74,11 @@ def range_extensions(options) -> dict[int, object]:
         return out
     try:
         scanned = _wire.scan_fields(raw)
-    except ValueError:  # pragma: no cover - options 字节损坏时宁可退化也不崩
+    except ValueError as exc:
+        # 运行期刻意**不抛**：一份坏 option 不该打断 register_all_tables 的整轮注册。
+        # 但绝不能无声——退化的后果是"这个 message 看起来一个扩展都没有"，
+        # 表现为表名退回 proto full name、主键凭空消失，症状离根因十万八千里。
+        log.warning("option 裸字节扫描失败，已退化为只读已注册的扩展：%s", exc)
         return out
     for num, value in scanned.items():
         if num >= _EXTENSION_RANGE_START and num not in out:

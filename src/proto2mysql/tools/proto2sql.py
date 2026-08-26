@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,18 @@ class Table:
     sql: str  # 建表 SQL（含末尾分号；drop 开启时含前置 DROP 语句）
 
 
+def _force_utf8_stdio() -> None:
+    """让 Windows 旧代码页也能打印中文帮助和生成结果。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
 def _protoc_argv() -> list[str]:
     """优先用 grpcio-tools 自带的 protoc，退回 PATH 上的 protoc。"""
     try:
@@ -45,15 +58,33 @@ def _protoc_argv() -> list[str]:
 
         return [sys.executable, "-m", "grpc_tools.protoc"]
     except ImportError:
-        return ["protoc"]
+        pass
+
+    exe = shutil.which("protoc")
+    if exe is None:
+        # grpcio-tools 是基础依赖；还能走到这里说明安装被裁剪/损坏，或者有人直接
+        # 从源码目录运行但没装项目依赖。仍给可操作的修复提示，别让 subprocess
+        # 抛一个裸的 FileNotFoundError。
+        raise RuntimeError(
+            "proto2sql 需要 protoc。装法二选一：\n"
+            '  pip install --upgrade proto2mysql grpcio-tools\n'
+            "  或把系统的 protoc 放进 PATH"
+        )
+    return [exe]
 
 
-def build_descriptor_set(
-    proto_files: Sequence[str], import_paths: Sequence[str] = ()
-) -> descriptor_pb2.FileDescriptorSet:
-    """调 protoc 把 .proto 编译成 FileDescriptorSet。
+def _resolve_inputs(
+    proto_files: Sequence[str], import_paths: Sequence[str]
+) -> tuple[list[str], list[str]]:
+    """算出传给 protoc 的 ``-I`` 列表与文件名列表，并校验**每个输入都指向它自己**。
 
-    每个输入文件所在目录会自动加入 import 搜索路径（与 Go 版 resolveInputs 一致）。
+    protoc 只吃"相对某个 -I 的文件名"，所以这里把每个输入拆成「父目录进 -I、
+    basename 进参数」。问题是 basename 会碰撞：``a/user.proto`` 与 ``b/user.proto``
+    都变成 ``user.proto``，protoc 按 -I 顺序解析、两次都拿到 ``a/user.proto``——
+    第二个文件**根本没被编译**，而整条命令返回 0，产出的 schema 里就少了那几张表。
+    没有任何提示，只有下次建表时报 Unknown table。
+
+    同理，某个 ``-I`` 目录里恰好有个同名文件也会把输入遮蔽掉。两种都在这里 fail-closed。
     """
     paths: list[str] = []
     for p in import_paths:
@@ -66,6 +97,34 @@ def build_descriptor_set(
         if parent not in paths:
             paths.append(parent)
         names.append(path.name)
+
+    for pf, name in zip(proto_files, names):
+        given = Path(pf)
+        hit = next((Path(d) / name for d in paths if (Path(d) / name).is_file()), None)
+        if hit is None:
+            raise RuntimeError(f"找不到输入文件: {pf}")
+        if not given.is_file():
+            # protoc 的标准写法：文件名是**相对某个 -I 目录**的，它本身不是一条
+            # 可用路径（`proto2sql -I proto account.proto`）。这种情况下 hit 就是
+            # 它自己，不算遮蔽——早先在这里直接拒掉，把最常见的调用形式给挡了。
+            continue
+        if hit.resolve() != given.resolve():
+            raise RuntimeError(
+                f"输入 {pf} 会被 {hit} 遮蔽——protoc 只按文件名 {name} 解析，"
+                f"两个同名文件里只有靠前的那个会被编译，另一个静默漏掉。\n"
+                f"  请把它们改成不同的文件名，或者分两次调用。"
+            )
+    return paths, names
+
+
+def build_descriptor_set(
+    proto_files: Sequence[str], import_paths: Sequence[str] = ()
+) -> descriptor_pb2.FileDescriptorSet:
+    """调 protoc 把 .proto 编译成 FileDescriptorSet。
+
+    每个输入文件所在目录会自动加入 import 搜索路径（与 Go 版 resolveInputs 一致）。
+    """
+    paths, names = _resolve_inputs(proto_files, import_paths)
 
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "descriptor.pb"
@@ -176,7 +235,29 @@ def _build_table_sql(md, table_name: str, drop: bool) -> str:
     return sql
 
 
+#: 不能出现在文件名里的字符。按 Windows 的非法字符集来（它是各平台的超集）。
+_FILENAME_UNSAFE = set(r'/\:*?"<>|') | {chr(c) for c in range(32)}
+
+
+def _out_path(out_dir: Path, table_name: str) -> Path:
+    """把表名落成 out_dir 下的文件名；越界或不能当文件名就抛 ValueError。
+
+    表名来自 proto 的 ``table_name`` 选项，是**输入数据**而不是常量：带上
+    ``../`` 或盘符就能把 .sql 写到 --out-dir 之外，而 ``Path.__truediv__``
+    两种都不拦（``out_dir / "../../x.sql"`` 老老实实往上走）。
+    """
+    if not table_name or set(table_name) & _FILENAME_UNSAFE or not table_name.strip("."):
+        raise ValueError(f"表名 {table_name!r} 不能安全地当文件名；请改用 -o 合并输出")
+    path = (out_dir / f"{table_name}.sql").resolve()
+    # 真正的闸是"归一化之后父目录相等"：光靠字符白名单挡不住符号链接一类的花样
+    if path.parent != out_dir.resolve():
+        raise ValueError(f"表名 {table_name!r} 会把文件写到 --out-dir 之外：{path}")
+    return path
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    # 必须在 ArgumentParser 之前；--help 本身就含中文，晚一行都会先编码崩溃。
+    _force_utf8_stdio()
     parser = argparse.ArgumentParser(
         prog="proto2sql",
         description="从 .proto 生成 MySQL 建表 SQL（不连库）",
@@ -186,11 +267,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "-I", "--include", action="append", default=[], metavar="DIR",
         help="import 搜索目录（可重复）",
     )
-    parser.add_argument(
+    # 二选一必须交给 argparse 管：早先只在 help 里写了"与 -o 二选一"，
+    # 真的两个都给时 --out-dir 静默胜出、-o 指定的文件一个字都不会写，
+    # 而退出码是 0——脚本里看不出任何异常。
+    out = parser.add_mutually_exclusive_group()
+    out.add_argument(
         "-o", "--output", metavar="FILE",
         help="所有表合并写入该文件；不给则打到标准输出",
     )
-    parser.add_argument(
+    out.add_argument(
         "--out-dir", metavar="DIR",
         help="每张表一个 <表名>.sql，写到该目录（与 -o 二选一）",
     )
@@ -226,11 +311,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.out_dir:
         out_dir = Path(args.out_dir)
+        try:  # 先把全部路径算完再落盘：宁可一张都不写，也不写一半到目录外
+            planned = [(tbl, _out_path(out_dir, tbl.name)) for tbl in tables]
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
         out_dir.mkdir(parents=True, exist_ok=True)
-        for t in tables:
-            path = out_dir / f"{t.name}.sql"
-            path.write_text(banner + t.sql + "\n", encoding="utf-8", newline="\n")
-            print(f"生成表 {t.name} -> {path}")
+        for tbl, path in planned:
+            path.write_text(banner + tbl.sql + "\n", encoding="utf-8", newline="\n")
+            print(f"生成表 {tbl.name} -> {path}")
         return 0
 
     body = banner + "".join(f"{t.sql}\n\n" for t in tables)

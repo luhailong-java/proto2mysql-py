@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+from decimal import Decimal
 
 import pytest
 
@@ -198,6 +199,31 @@ def test_int_out_of_range_rejected(kitchenpb):
         pbconv.set_field_from_raw(m, field(m, "zone_id"), "99999999999")
 
 
+@pytest.mark.parametrize("raw", ["1.9", 1.9, Decimal("1.9")])
+def test_fractional_database_value_is_rejected_for_integer_field(kitchenpb, raw):
+    """数据库返回的小数不能被 ``int()`` 静默截断成另一个主键/计数值。"""
+    m = kitchenpb.kitchen_sink(id=7)
+
+    with pytest.raises(ValueError, match="fractional part"):
+        pbconv.set_field_from_raw(m, field(m, "id"), raw)
+
+    assert m.id == 7, "解析失败不能改掉调用方已有的字段值"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [float("nan"), float("inf"), float("-inf"), "NaN", "Infinity", "-Infinity"],
+)
+def test_non_finite_database_float_is_rejected(kitchenpb, raw):
+    """写侧和读侧都必须拒绝 MySQL 无法表达的 NaN/Inf。"""
+    m = kitchenpb.kitchen_sink(f64=1.25)
+
+    with pytest.raises(NonFiniteFloatError):
+        pbconv.set_field_from_raw(m, field(m, "f64"), raw)
+
+    assert m.f64 == 1.25, "解析失败不能改掉调用方已有的字段值"
+
+
 def test_enum_is_numeric(kitchenpb):
     m = kitchenpb.kitchen_sink(tier=kitchenpb.GRADE_GOLD)
     assert pbconv.serialize_field_value(m, field(m, "tier")) == "1"
@@ -239,6 +265,34 @@ def test_empty_value_restores_default_keeping_presence(kitchenpb):
     pbconv.set_field_from_raw(m, field(m, "opt_score"), "")
     assert m.HasField("opt_score")
     assert m.opt_score == 0
+
+
+def test_real_oneof_is_rejected_before_row_mutation(kitchenpb):
+    """行格式没有 oneof 判别位；直接使用 pbconv 也必须 fail-fast。"""
+    from proto2mysql.errors import InvalidFieldKindError
+
+    m = kitchenpb.one_of_probe(id=99)
+
+    with pytest.raises(InvalidFieldKindError, match="oneof"):
+        pbconv.serialize_field_value(m, field(m, "a"))
+
+    with pytest.raises(InvalidFieldKindError, match="oneof"):
+        pbconv.parse_from_row(m, (1, 2, "", 3))
+
+    assert m.id == 99, "发现不受支持的 oneof 时不能留下半行更新"
+
+
+def test_proto3_optional_is_not_rejected_by_field_conversion(kitchenpb):
+    """proto3 optional 的 synthetic oneof 必须保留 presence 与正常转换能力。"""
+    m = kitchenpb.kitchen_sink(opt_score=0)
+    fd = field(m, "opt_score")
+
+    assert pbconv.serialize_field_value(m, fd) == "0"
+
+    out = kitchenpb.kitchen_sink()
+    pbconv.set_field_from_raw(out, fd, "0")
+    assert out.HasField("opt_score")
+    assert out.opt_score == 0
 
 
 def test_full_row_roundtrip(kitchenpb):
@@ -343,3 +397,55 @@ def test_null_columns_do_not_leak_across_rows(kitchenpb):
     assert out.payload == b"", "bytes 列为 NULL 必须清空，否则串到下一行"
     assert out.tier == 0, "enum 列为 NULL 必须归零"
     assert out.sub.b == "", "message 列为 NULL 必须 ClearField"
+
+
+def test_repeated_and_map_do_not_leak_across_rows(kitchenpb):
+    """repeated / map 列跨行不能串——与上面那条是同一个 P0 的另外半边。
+
+    _set_scalar_default 那条修完之后，容器列仍然漏着：``_parse_container`` 在
+    「列是 NULL / 空」和「map」两条路上都不清空目标容器。于是复用同一个 message
+    连查两行时：
+
+        out.tags  上一行的元素原样留着（空列直接 return，压根没碰容器）
+        out.attrs 上一行的键与这一行的键**合并**成一份（只 MergeFrom 不 Clear）
+
+    症状与 bytes/enum 那条完全一样：查第二个玩家读出第一个玩家的背包，且不报错。
+    """
+    from proto2mysql import pbconv
+
+    holder = kitchenpb.kitchen_sink()
+    holder.attrs["new"] = 2
+    attrs_payload = holder.SerializeToString()
+
+    out = kitchenpb.kitchen_sink()
+
+    # 第一行：两个容器都有值
+    out.tags.extend([11, 22])
+    out.attrs["old"] = 1
+
+    # 第二行：tags 列是 NULL，attrs 列是另一份只含 "new" 的载荷
+    tags_fd = out.DESCRIPTOR.fields_by_name["tags"]
+    attrs_fd = out.DESCRIPTOR.fields_by_name["attrs"]
+    pbconv.set_field_from_raw(out, tags_fd, None)
+    pbconv.set_field_from_raw(out, attrs_fd, attrs_payload)
+
+    assert list(out.tags) == [], "repeated 列为 NULL 必须清空，否则串到下一行"
+    assert dict(out.attrs) == {"new": 2}, "map 列必须覆盖而不是与上一行合并"
+
+
+def test_container_parse_failure_keeps_caller_data(kitchenpb):
+    """容器解析失败时不能先把调用方的数据清掉。
+
+    清空必须发生在解析成功之后：否则一条坏字节就把调用方 message 里原有的容器
+    抹成空，调用方捕获异常后拿到的是"被改坏了一半"的对象。
+    """
+    from proto2mysql import pbconv
+
+    out = kitchenpb.kitchen_sink()
+    out.tags.extend([11, 22])
+    tags_fd = out.DESCRIPTOR.fields_by_name["tags"]
+
+    with pytest.raises(ValueError):
+        pbconv.set_field_from_raw(out, tags_fd, b"\xff\xff\xff\xff\xff\xff")
+
+    assert list(out.tags) == [11, 22], "解析失败不该动调用方已有的数据"

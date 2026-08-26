@@ -20,6 +20,8 @@ dependencies = [
     # 描述符反射 + wire 编解码全靠它；5.29 起 FieldDescriptor 有 is_repeated/has_presence，
     # 而 7.x 移除了 label —— 本库只用前者，两边都能跑。
     "protobuf>=5.29",
+    # proto2sql 随基础安装注册为 console script；它必须在基础安装后立即可用。
+    "grpcio-tools>=1.71",
 ]
 
 [project.optional-dependencies]
@@ -29,7 +31,6 @@ mysql = ["PyMySQL>=1.1"]
 sqlalchemy = ["SQLAlchemy>=2.0"]
 dev = [
     "pytest>=8.3",
-    "grpcio-tools>=1.71",  # 只用来在测试里现场生成 _pb2
     "PyMySQL>=1.1",
 ]
 

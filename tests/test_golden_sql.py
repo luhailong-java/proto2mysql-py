@@ -60,13 +60,14 @@ def test_insert_variants(b, msg, testpb):
 
     check(
         b.insert_ignore(msg),
-        f"INSERT IGNORE INTO `golang_test` ({ALL_COLS}) VALUES (?, ?, ?, ?, ?, ?)",
+        INSERT_PART + " ON DUPLICATE KEY UPDATE `id` = `id`",
         INSERT_ARGS,
     )
 
     check(
         b.insert_ignore_set_fields(msg),
-        "INSERT IGNORE INTO `golang_test` (`id`, `ip`, `port`) VALUES (?, ?, ?)",
+        "INSERT INTO `golang_test` (`id`, `ip`, `port`) VALUES (?, ?, ?)"
+        " ON DUPLICATE KEY UPDATE `id` = `id`",
         ["7", "10.0.0.1", "8080"],
     )
 
@@ -87,8 +88,9 @@ def test_batch_insert(b, testpb):
 
     check(
         b.batch_insert_ignore(msgs),
-        f"INSERT IGNORE INTO `golang_test` ({ALL_COLS}) "
-        "VALUES (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?)",
+        f"INSERT INTO `golang_test` ({ALL_COLS}) "
+        "VALUES (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?)"
+        " ON DUPLICATE KEY UPDATE `id` = `id`",
         both,
     )
 

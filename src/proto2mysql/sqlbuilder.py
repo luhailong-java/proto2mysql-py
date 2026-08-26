@@ -30,12 +30,12 @@ from google.protobuf.message import Message
 from . import pbconv
 from .errors import (
     EmptyWhereClauseError,
-    FieldNotFoundError,
     PrimaryKeyNotFoundError,
     Proto2MySQLError,
 )
 from .options import TableOption
 from .table import (
+    NUMERIC_FIELD_TYPES,
     MessageTable,
     Statement,
     build_placeholders,
@@ -57,25 +57,9 @@ class EmptyValuesError(Proto2MySQLError):
 
 _T = FieldDescriptor
 
-# 数值列判定。注意这里**包含** sint/fixed/sfixed：Go 版 isNumericKind 就是这么写的。
-# 它们建表会落到 TEXT、写入会被 pbconv 拒——但那是另一条链路上的既有限制，
-# 这里保持与 Go 版同样的判定，别顺手"修"成不一致。
-_NUMERIC_TYPES = frozenset(
-    {
-        _T.TYPE_INT32,
-        _T.TYPE_SINT32,
-        _T.TYPE_SFIXED32,
-        _T.TYPE_INT64,
-        _T.TYPE_SINT64,
-        _T.TYPE_SFIXED64,
-        _T.TYPE_UINT32,
-        _T.TYPE_FIXED32,
-        _T.TYPE_UINT64,
-        _T.TYPE_FIXED64,
-        _T.TYPE_FLOAT,
-        _T.TYPE_DOUBLE,
-    }
-)
+# 数值列判定统一放在 table.NUMERIC_FIELD_TYPES（那边写了为什么只能有一份），
+# 这里留个别名，老代码与外部引用不受影响。
+_NUMERIC_TYPES = NUMERIC_FIELD_TYPES
 
 
 @dataclass(frozen=True)
@@ -131,6 +115,10 @@ class Assign:
     col: str  # 原始列名，构建时用于校验该列存在于消息
     expr: str  # 完整赋值表达式，列名已转义，如 "`gold` = `gold` + ?"
     args: tuple = ()  # expr 里 ? 对应的参数，按出现顺序
+    #: 该表达式对列做算术运算、或拿 0 当哨兵比较。构造期必须确认列是数值型——
+    #: 落到文本列上 MySQL 会隐式转换，非严格模式下静默把原值抹掉（见
+    #: MessageTable.numeric_field）。校验统一在 _build_assigns 那一个汇聚点做。
+    numeric: bool = False
 
 
 def set_col(col: str, val: Any) -> Assign:
@@ -142,13 +130,13 @@ def set_col(col: str, val: Any) -> Assign:
 def add_col(col: str, delta: Any) -> Assign:
     """原地累加：``col = col + ?``（货币/经验/计数器，避免读-改-写竞态）"""
     e = escape_mysql_name(col)
-    return Assign(col, f"{e} = {e} + ?", (delta,))
+    return Assign(col, f"{e} = {e} + ?", (delta,), numeric=True)
 
 
 def sub_col(col: str, delta: Any) -> Assign:
     """原地扣减：``col = col - ?``（是否允许扣成负数由 WHERE 守卫决定）"""
     e = escape_mysql_name(col)
-    return Assign(col, f"{e} = {e} - ?", (delta,))
+    return Assign(col, f"{e} = {e} - ?", (delta,), numeric=True)
 
 
 def set_col_expr(col: str, expr: str, *args: Any) -> Assign:
@@ -175,28 +163,31 @@ def set_new(col: str) -> Assign:
 def add_new(col: str) -> Assign:
     """冲突时累加新值：``col = col + VALUES(col)``（发奖/加币的原子累加写法）"""
     e = escape_mysql_name(col)
-    return Assign(col, f"{e} = {e} + VALUES({e})")
+    return Assign(col, f"{e} = {e} + VALUES({e})", numeric=True)
 
 
 def min_new(col: str) -> Assign:
     """冲突时取较小值：``col = LEAST(col, VALUES(col))``（退避时间取更早的一次）"""
     e = escape_mysql_name(col)
-    return Assign(col, f"{e} = LEAST({e}, VALUES({e}))")
+    return Assign(col, f"{e} = LEAST({e}, VALUES({e}))", numeric=True)
 
 
 def max_new(col: str) -> Assign:
     """冲突时取较大值：``col = GREATEST(col, VALUES(col))``（水位/序号只增不减）"""
     e = escape_mysql_name(col)
-    return Assign(col, f"{e} = GREATEST({e}, VALUES({e}))")
+    return Assign(col, f"{e} = GREATEST({e}, VALUES({e}))", numeric=True)
 
 
 def set_new_if_zero(col: str) -> Assign:
     """首写生效：``col = IF(col = 0, VALUES(col), col)``
 
     已经写过（非 0）就保持不动，用于"第一次落的时间戳/终态不可被覆盖"。
+
+    只能用在数值列上：``'abc' = 0`` 在非严格 sql_mode 下为**真**，
+    于是一个早就写过的文本列会被判成"还没写过"，第二次写照样覆盖掉。
     """
     e = escape_mysql_name(col)
-    return Assign(col, f"{e} = IF({e} = 0, VALUES({e}), {e})")
+    return Assign(col, f"{e} = IF({e} = 0, VALUES({e}), {e})", numeric=True)
 
 
 def keep_old(col: str) -> Assign:
@@ -261,6 +252,9 @@ class SQLBuilder:
     def _check_column(self, col: str) -> FieldDescriptor:
         return self._table.field(col)
 
+    def _check_numeric_column(self, col: str) -> FieldDescriptor:
+        return self._table.numeric_field(col)
+
     # ── INSERT ──────────────────────────────────────────────────────────
 
     def insert(self, m: Message) -> Statement:
@@ -283,18 +277,14 @@ class SQLBuilder:
         return Statement(stmt, args)
 
     def insert_ignore(self, m: Message) -> Statement:
-        """幂等插入：``INSERT IGNORE INTO ...``，主键/唯一键冲突时跳过。
-
-        注意 IGNORE 会把一部分真实错误（类型截断等）降级成 warning，只在"重复即跳过"
-        确实是预期行为时使用；只想拿行锁不改数据用 :meth:`upsert_keep_old`。
-        """
+        """幂等插入：重复键时不改数据，其他错误仍按原样报错。"""
         stmt = self._table.get_insert_sql(m)
-        return Statement(_to_insert_ignore(stmt.sql), stmt.args)
+        return self._ignore_duplicate(stmt)
 
     def insert_ignore_set_fields(self, m: Message) -> Statement:
-        """列子集版的 INSERT IGNORE（列选取规则同 :meth:`insert_set_fields`）。"""
+        """列子集版的幂等插入（列选取规则同 :meth:`insert_set_fields`）。"""
         stmt = self.insert_set_fields(m)
-        return Statement(_to_insert_ignore(stmt.sql), stmt.args)
+        return self._ignore_duplicate(stmt)
 
     def replace(self, m: Message) -> Statement:
         """整行替换：``REPLACE INTO ...``
@@ -309,7 +299,28 @@ class SQLBuilder:
 
     def batch_insert_ignore(self, msgs: Sequence[Message]) -> Statement:
         stmt = self._table.get_batch_insert_sql(msgs)
-        return Statement(_to_insert_ignore(stmt.sql), stmt.args)
+        return self._ignore_duplicate(stmt)
+
+    def _ignore_duplicate(self, insert: Statement) -> Statement:
+        """用无副作用 ODKU 实现“仅忽略重复键”。
+
+        ``INSERT IGNORE`` 不只忽略重复键，还会把截断、非空等真实数据
+        错误降成 warning。自赋值 ODKU 仅吞掉冲突，其他错误仍 fail-closed。
+        """
+        anchor = next(
+            (name for name in self._table.primary_key if self._table.has_field(name)),
+            None,
+        )
+        if anchor is None:
+            if not self._table.fields:
+                raise Proto2MySQLError(
+                    f"cannot ignore duplicate for empty message table {self._table.table_name}"
+                )
+            anchor = self._table.fields[0].name
+        escaped = escape_mysql_name(anchor)
+        return Statement(
+            f"{insert.sql} ON DUPLICATE KEY UPDATE {escaped} = {escaped}", insert.args
+        )
 
     def batch_replace(self, msgs: Sequence[Message]) -> Statement:
         return self._table.get_batch_replace_sql(msgs)
@@ -331,11 +342,7 @@ class SQLBuilder:
         if not cols:
             raise NoAssignsError("no assignments provided")
         for col in cols:
-            fd = self._check_column(col)
-            if fd.type not in _NUMERIC_TYPES:
-                raise Proto2MySQLError(
-                    f"column {col} in table {self._table.table_name} is not numeric"
-                )
+            self._check_numeric_column(col)
         return self._upsert_by(m, list(cols), add_new)
 
     def upsert_keep_old(self, m: Message) -> Statement:
@@ -392,6 +399,17 @@ class SQLBuilder:
         return [mk(col) for col in cols]
 
     def _append_on_duplicate(self, insert: Statement, assigns: list[Assign]) -> Statement:
+        primary_keys = set(self._table.primary_key)
+        for assign in assigns:
+            if assign.col not in primary_keys:
+                continue
+            escaped = escape_mysql_name(assign.col)
+            if assign.expr == f"{escaped} = {escaped}" and not assign.args:
+                continue  # lock-only：自赋值不改变主键
+            raise Proto2MySQLError(
+                f"primary key column {assign.col} in table {self._table.table_name} "
+                "cannot be updated by ON DUPLICATE KEY UPDATE"
+            )
         set_clause, set_args = self._build_assigns(assigns)
         return Statement(
             f"{insert.sql} ON DUPLICATE KEY UPDATE {set_clause}", insert.args + set_args
@@ -409,7 +427,14 @@ class SQLBuilder:
         clauses: list[str] = []
         args: list[Any] = []
         for a in assigns:
-            self._check_column(a.col)
+            # 算术赋值必须落在数值列上；其余赋值只确认列存在（沿用原行为）。
+            # 这里是全部 Assign 的唯一汇聚点，放这一处就覆盖了
+            # update_assigns_by_pk / update_assigns_where / upsert_with /
+            # batch_upsert_with / incr_by_pk / decr_by_pk_if_enough 全部入口。
+            if a.numeric:
+                self._check_numeric_column(a.col)
+            else:
+                self._check_column(a.col)
             clauses.append(a.expr)
             args.extend(a.args)
         return ", ".join(clauses), args
@@ -614,7 +639,9 @@ class SQLBuilder:
         """
         if delta <= 0:
             raise Proto2MySQLError(f"delta must be positive, got {delta}")
-        self._check_column(col)
+        # 扣减本身和 `col >= ?` 这条守卫都要求数值列：文本列上
+        # 'abc' >= 100 走的是字符串比较，守卫会给出与直觉相反的结果。
+        self._check_numeric_column(col)
         where, where_args = self._table.primary_key_where(m)
         guard = f"{escape_mysql_name(col)} >= ?"
         return self.update_assigns_where(
@@ -696,8 +723,3 @@ class SQLBuilder:
                 f"primary key column, got {len(self._table.primary_key)}"
             )
         return self._table.primary_key[0]
-
-
-def _to_insert_ignore(stmt: str) -> str:
-    """把 INSERT 前缀换成 INSERT IGNORE。"""
-    return "INSERT IGNORE" + stmt[len("INSERT") :]

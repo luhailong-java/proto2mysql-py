@@ -22,11 +22,35 @@ import json
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-def load(path: str) -> dict:
+from _stdio import force_utf8_stdio  # noqa: E402
+
+
+def load(path: str, expect_lang: str) -> dict:
+    """读一份语料并做入口校验。两道闸都是零成本的 fail-closed。
+
+    **lang**：把同一份产物传两次、或者两个参数写反，是这条链最容易犯的误用——
+    一致性恒成立、门禁恒绿，而契约其实一次都没验过。lang 字段两边一直在写，
+    只是从来没人查。
+
+    **用例名唯一**：用例名是对拍的主键。重名在 dict 里互相覆盖，被覆盖那条的
+    分叉永远比不出来（实测：构造两条同名用例，真实分叉被吃掉、退出码 0）。
+    Python 侧有 tests/test_parity_corpus.py 守着，而 Go 侧的产物是**外部输入**，
+    只能在入口这里守。
+    """
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if "cases" not in data:
         raise SystemExit(f"{path} 不像语料文件（没有 cases 字段）")
+    lang = data.get("lang")
+    if lang != expect_lang:
+        raise SystemExit(
+            f"{path} 的 lang={lang!r}，这里要的是 {expect_lang!r}——两份产物传反了？"
+        )
+    names = [c["name"] for c in data["cases"]]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise SystemExit(f"{path} 用例名重复，无法作为对拍主键: {dupes}")
     return data
 
 
@@ -53,14 +77,16 @@ def caret_context(a: str, b: str, pos: int, width: int = 60) -> str:
 
 
 def main(argv=None) -> int:
+    # --help 里就有中文，必须先于 argparse 的任何输出切换编码。
+    force_utf8_stdio()
     ap = argparse.ArgumentParser(description="比对两份跨语言对拍语料")
     ap.add_argument("go_file", help="Go 侧产物")
     ap.add_argument("py_file", help="Python 侧产物")
     ap.add_argument("--max-report", type=int, default=20, help="最多报告多少条差异")
     args = ap.parse_args(argv)
 
-    go = load(args.go_file)
-    py = load(args.py_file)
+    go = load(args.go_file, "go")
+    py = load(args.py_file, "py")
 
     if go.get("corpus_version") != py.get("corpus_version"):
         print(f"❌ 语料版本不一致: go={go.get('corpus_version')} py={py.get('corpus_version')}")

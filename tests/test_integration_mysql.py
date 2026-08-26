@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 import pytest
 
 from proto2mysql import DB, DictCache
-from proto2mysql.errors import DuplicateKeyError, NoRowsFoundError
+from proto2mysql.errors import DuplicateKeyError, NoRowsFoundError, Proto2MySQLError
 
 pymysql = pytest.importorskip("pymysql")
 
@@ -119,6 +119,22 @@ def test_sync_is_idempotent(db, conn, kitchenpb):
     db.clear_column_cache("kitchen.kitchen_sink")
     # 第二次同步不该产生任何 ALTER
     assert db.generate_migration_sql(kitchenpb.kitchen_sink) == ""
+
+
+def test_same_name_non_unique_index_fails_closed(db, conn, kitchenpb):
+    """同名不等于同结构；唯一约束漂移时不能让服务带病继续启动。"""
+    drop(conn, "kitchen_sink")
+    db.create_or_update_table(kitchenpb.kitchen_sink)
+    with conn.cursor() as cur:
+        # TiDB 不接受同一条 ALTER 里 DROP+ADD 同名索引，拆开保持两端可执行。
+        cur.execute("ALTER TABLE `kitchen_sink` DROP INDEX `uk_kitchen_sink`")
+        cur.execute(
+            "ALTER TABLE `kitchen_sink` "
+            "ADD INDEX `uk_kitchen_sink` (`name`(191), `zone_id`)"
+        )
+
+    with pytest.raises(Proto2MySQLError, match="uk_kitchen_sink"):
+        db.generate_migration_sql(kitchenpb.kitchen_sink)
 
 
 # ── 读写往返 ────────────────────────────────────────────────────────────
@@ -301,6 +317,31 @@ def test_transaction_commit_persists(db, conn, testpb):
     assert db.count(testpb.golang_test()) == 1
 
 
+def test_original_db_cannot_open_nested_transaction(db, conn, testpb):
+    """绕回父 DB 再 BEGIN 不能把外层未提交写隐式提交掉。"""
+    drop(conn, "golang_test")
+    db.create_or_update_table(testpb.golang_test)
+
+    with pytest.raises(Proto2MySQLError, match="nested transaction"):
+        with db.transaction() as tx:
+            tx.insert(testpb.golang_test(id=1, ip="outer"))
+            with db.transaction():
+                pass
+
+    assert db.count(testpb.golang_test()) == 0
+
+
+def test_managed_transaction_rejects_raw_external_begin(db, conn):
+    """同一连接已有外部事务时，不能再次 BEGIN 并隐式提交它。"""
+    conn.begin()
+    try:
+        with pytest.raises(Proto2MySQLError, match="外部事务"):
+            with db.transaction():
+                pass
+    finally:
+        conn.rollback()
+
+
 def test_for_update_inside_transaction(db, conn, testpb):
     drop(conn, "golang_test")
     db.create_or_update_table(testpb.golang_test)
@@ -321,6 +362,8 @@ def test_for_update_inside_transaction(db, conn, testpb):
 
 
 def test_rename_by_field_number_preserves_real_data(conn, dbname, kitchenpb):
+    from proto2mysql import with_indexes
+
     drop(conn, "rename_demo")
 
     old = DB(conn, dbname)
@@ -330,7 +373,7 @@ def test_rename_by_field_number_preserves_real_data(conn, dbname, kitchenpb):
 
     # 换成新版 proto：字段 2 改了名、多了字段 4
     new = DB(conn, dbname)
-    new.register_table(kitchenpb.rename_after)
+    new.register_table(kitchenpb.rename_after, with_indexes("new_name"))
     migration = new.generate_migration_sql(kitchenpb.rename_after)
     assert "CHANGE COLUMN `old_name` `new_name`" in migration
     assert "ADD COLUMN `added`" in migration
@@ -343,9 +386,41 @@ def test_rename_by_field_number_preserves_real_data(conn, dbname, kitchenpb):
     assert out.score == 42
     assert out.added == 0
 
+    with conn.cursor() as cur:
+        cur.execute("SHOW INDEX FROM `rename_demo`")
+        assert "idx_rename_demo_0" in {row[2] for row in cur.fetchall()}
+
     # 再同步一次应无差异
     new.clear_column_cache("kitchen.rename_after")
     assert new.generate_migration_sql(kitchenpb.rename_after) == ""
+
+
+def test_renamed_primary_key_precedes_dependent_index(
+    conn, dbname, kitchenpb
+):
+    """先改名再补主键/索引，兼容 TiDB 不解析同句新列名的限制。"""
+    from proto2mysql import with_indexes
+
+    drop(conn, "keyword_col")
+    with conn.cursor() as cur:
+        cur.execute(
+            "CREATE TABLE `keyword_col` ("
+            "`old_id` bigint NOT NULL DEFAULT 0 COMMENT 'pb:1', "
+            "`key` MEDIUMTEXT COMMENT 'pb:2', "
+            "`text` MEDIUMTEXT COMMENT 'pb:3')"
+        )
+
+    db = DB(conn, dbname)
+    db.register_table(kitchenpb.keyword_col, with_indexes("id"))
+    db.create_or_update_table(kitchenpb.keyword_col)
+
+    with conn.cursor() as cur:
+        cur.execute("SHOW INDEX FROM `keyword_col`")
+        index_names = {row[2] for row in cur.fetchall()}
+        cur.execute("SHOW COLUMNS FROM `keyword_col`")
+        column_names = {row[0] for row in cur.fetchall()}
+    assert "old_id" not in column_names and "id" in column_names
+    assert {"PRIMARY", "idx_keyword_col_0"} <= index_names
 
 
 def test_add_column_on_existing_table(conn, dbname, testpb):
@@ -392,7 +467,49 @@ def test_missing_primary_key_is_added(conn, dbname, testpb):
     assert db.table_has_primary_key("golang_test") is True
 
 
+def test_missing_auto_increment_primary_key_column_is_added_with_constraint(
+    conn, dbname, testpb
+):
+    """主键列本身也不存在时，ADD COLUMN 与 ADD PRIMARY KEY 必须同句。"""
+    if is_tidb(conn):
+        pytest.skip("TiDB 的 AUTO_INCREMENT ALTER 能力与 MySQL 不同")
+    drop(conn, "golang_test")
+    with conn.cursor() as cur:
+        cur.execute("CREATE TABLE `golang_test` (`ip` MEDIUMTEXT)")
+
+    db = DB(conn, dbname)
+    db.register_table(testpb.golang_test)
+    db.create_or_update_table(testpb.golang_test)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COLUMN_NAME, EXTRA FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='golang_test' AND COLUMN_NAME='id'",
+            (dbname,),
+        )
+        assert cur.fetchone() == ("id", "auto_increment")
+    assert db.table_has_primary_key("golang_test") is True
+
+
 # ── 缓存 ────────────────────────────────────────────────────────────────
+
+
+def test_cache_rejects_implicit_transaction_connection(db, conn):
+    conn.autocommit(False)
+    with pytest.raises(Proto2MySQLError, match="autocommit=True"):
+        db.enable_cache(DictCache())
+
+
+def test_cache_rejects_raw_begin_on_autocommit_connection(db, conn, testpb):
+    """PyMySQL begin() 后 autocommit 标志仍为 True，但共享缓存仍必须绕过。"""
+    db.enable_cache(DictCache())
+    conn.begin()
+    try:
+        assert conn.get_autocommit() is True
+        with pytest.raises(Proto2MySQLError, match="外部事务"):
+            db.find_one_by_pk(testpb.golang_test(id=1))
+    finally:
+        conn.rollback()
 
 
 def test_cache_aside_against_real_db(db, conn, testpb):
@@ -419,3 +536,55 @@ def test_cache_aside_against_real_db(db, conn, testpb):
     fresh = testpb.golang_test(id=1)
     db.find_one_by_pk(fresh)
     assert fresh.ip == "v3"
+
+
+@pytest.mark.parametrize("method", ["save", "insert_on_dup_update"])
+def test_upsert_secondary_unique_conflict_does_not_modify_owner(
+    db, conn, kitchenpb, method
+):
+    """同 UNIQUE、不同 PK 必须报 1062，不能把候选数据写进 owner。"""
+    drop(conn, "kitchen_sink")
+    db.create_or_update_table(kitchenpb.kitchen_sink)
+    db.insert(kitchenpb.kitchen_sink(id=7, name="same", zone_id=1, u32=10))
+
+    cache = DictCache()
+    db.enable_cache(cache, ttl=60)
+    cached = kitchenpb.kitchen_sink(id=7)
+    db.find_one_by_pk(cached)
+    assert len(cache) == 1
+
+    candidate = kitchenpb.kitchen_sink(id=8, name="same", zone_id=1, u32=99)
+    with pytest.raises(DuplicateKeyError):
+        getattr(db, method)(candidate)
+
+    # owner 没被写，原缓存也仍然有效；候选 PK 的不确定写路径已保守失效。
+    assert len(cache) == 1
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT `id`, `u32` FROM `kitchen_sink` ORDER BY `id`")
+        assert cur.fetchall() == ((7, 10),)
+
+    fresh = kitchenpb.kitchen_sink(id=7)
+    db.find_one_by_pk(fresh)
+    assert fresh.u32 == 10
+    with pytest.raises(NoRowsFoundError):
+        db.find_one_by_pk(kitchenpb.kitchen_sink(id=8))
+
+
+def test_batch_save_can_be_made_atomic_with_transaction(db, conn, kitchenpb):
+    """逐行 batch_save 遇到二级唯一键冲突时，显式事务会回滚先前行。"""
+    drop(conn, "kitchen_sink")
+    db.create_or_update_table(kitchenpb.kitchen_sink)
+    db.insert(kitchenpb.kitchen_sink(id=7, name="same", zone_id=1, u32=10))
+
+    rows = [
+        kitchenpb.kitchen_sink(id=8, name="new", zone_id=1, u32=20),
+        kitchenpb.kitchen_sink(id=9, name="same", zone_id=1, u32=99),
+    ]
+    with pytest.raises(DuplicateKeyError):
+        with db.transaction() as tx:
+            tx.batch_save(rows)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT `id`, `u32` FROM `kitchen_sink` ORDER BY `id`")
+        assert cur.fetchall() == ((7, 10),)

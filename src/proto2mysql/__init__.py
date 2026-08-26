@@ -1,6 +1,7 @@
 """proto2mysql —— 把 Protobuf 消息自动映射成 MySQL 表结构，并提供参数化的 CRUD / SQL 生成。
 
-Go 版 https://github.com/luyuancpp/proto2mysql 的 Python 实现，生成的 SQL 与其逐字节一致。
+Go 版 https://github.com/luyuancpp/proto2mysql 的 Python 实现；核心 SQL 语料逐字节对拍，
+少数安全边界的明确分叉见 README 与 docs/testing.md。
 
 三层用法，按需要的耦合度选：
 

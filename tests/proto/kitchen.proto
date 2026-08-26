@@ -93,3 +93,38 @@ message order_demo {
   string a  = 3;
   int64  b  = 1;
 }
+
+// oneof 的成员各占一列，行里没有判别位 —— 本库拒绝建表（见 MessageTable._reject_oneof）。
+// **刻意不写 table_name**：写了的话 register_all_tables 会在注册期直接抛错，
+// 把这份测试 proto 变成一颗地雷。测试里显式 MessageTable.from_message 即可。
+message one_of_probe {
+  int64 id = 1;
+  oneof body {
+    int32  a = 2;
+    string b = 3;
+  }
+  int64 tail = 4;
+}
+
+// repeated Timestamp：建表侧必须走 MEDIUMBLOB 而不是 DATETIME(6)
+// （写入侧把它当容器，写下去的是 proto wire 裸字节）。同样不给 table_name。
+message stamped_probe {
+  int64 id = 1;
+  repeated google.protobuf.Timestamp stamps = 2;
+  map<string, google.protobuf.Timestamp> stamp_map = 3;
+  google.protobuf.Timestamp single = 4;
+}
+
+// 合成 oneof 的名字**不一定**是 "_<字段名>"：`_x` 与消息里已有的名字冲突时，
+// protoc 会改用 `X_x`。这份消息完全合法，必须放行（见 pbconv.real_oneof）。
+message oneof_name_collision {
+  int64  id = 1;
+  string _x = 2;
+  optional int32 x = 3;
+}
+
+// 反过来：一个**真** oneof 的名字恰好长得像合成的，必须照样拒。
+message fake_synthetic_oneof {
+  int64 id = 1;
+  oneof _x { int32 x = 2; }
+}

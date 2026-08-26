@@ -13,6 +13,10 @@ Go 侧有一份对等的闸（parity_emit_test.go 的 TestParityCorpusCoversEver
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -80,3 +84,62 @@ def test_every_case_produces_something(case):
         assert case["sql"] == ""
     else:
         assert case["sql"].strip(), f"{case['name']} 产出了空 SQL"
+
+
+def _write_corpus(path: Path, lang: str, cases: list[dict]) -> None:
+    path.write_text(
+        json.dumps({"corpus_version": 1, "lang": lang, "cases": cases}),
+        encoding="utf-8",
+    )
+
+
+def test_diff_rejects_wrong_language_and_duplicate_case_names(tmp_path):
+    from parity_diff import load
+
+    wrong = tmp_path / "wrong.json"
+    _write_corpus(wrong, "py", [])
+    with pytest.raises(SystemExit, match="lang"):
+        load(str(wrong), "go")
+
+    duplicate = tmp_path / "duplicate.json"
+    case = {"name": "same", "sql": "SELECT 1", "args": []}
+    _write_corpus(duplicate, "go", [case, {**case, "sql": "SELECT 2"}])
+    with pytest.raises(SystemExit, match="重复"):
+        load(str(duplicate), "go")
+
+
+@pytest.mark.parametrize("script", ["parity_emit.py", "parity_diff.py", "parity_run.py"])
+def test_parity_help_survives_legacy_windows_stdout_encoding(script):
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "cp1252"
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / script), "--help"],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+    )
+    assert proc.returncode == 0, proc.stderr.decode("ascii", errors="replace")
+    assert b"UnicodeEncodeError" not in proc.stderr
+
+
+def test_parity_emit_runs_from_a_checkout_without_generated_stubs(tmp_path):
+    """模拟 fresh clone：只复制受版本控制的源码，刻意不复制 tests/gen。"""
+    checkout = tmp_path / "checkout"
+    shutil.copytree(ROOT / "src", checkout / "src")
+    shutil.copytree(ROOT / "tools", checkout / "tools")
+    shutil.copytree(ROOT / "tests" / "proto", checkout / "tests" / "proto")
+    (checkout / "tests").mkdir(exist_ok=True)
+    shutil.copy2(ROOT / "tests" / "_gen_stubs.py", checkout / "tests" / "_gen_stubs.py")
+
+    output = checkout / "parity.json"
+    proc = subprocess.run(
+        [sys.executable, str(checkout / "tools" / "parity_emit.py"), "-o", str(output)],
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert output.is_file()
+    assert json.loads(output.read_text(encoding="utf-8"))["cases"]

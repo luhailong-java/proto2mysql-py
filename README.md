@@ -3,12 +3,12 @@
 把 Protobuf 消息自动映射成 MySQL 表结构，并提供参数化的 CRUD 与 SQL 生成，不用手写 SQL。
 
 Go 版 [luyuancpp/proto2mysql](https://github.com/luyuancpp/proto2mysql) 的 Python 实现。
-**生成的 SQL 与 Go 版逐字节一致**（唯一例外见 [与 Go 版的差异](#与-go-版的差异)，
-那一条是修 Go 版一个会让建表直接失败的 bug）——同一份 `.proto` 在两边产出同一份 DDL/DML，
-所以 Go 服务与 Python 服务可以读写同一张表、共用同一份迁移脚本，一个服务一个服务地灰度迁移。
+核心 SQL 语料与 Go 版做逐字节对拍；少数为避免数据损坏而先在 Python 侧落地的安全分叉，
+明确列在[与 Go 版的差异](#与-go-版的差异)和[测试说明](docs/testing.md#刻意的分叉语料钉在-go-的口径上)。
+两边仍使用相同的表/列编码，可以读写同一张表；迁移 SQL 是否可共用则必须先过对拍和分叉审查。
 
 一致性不是靠"照着翻"保证的：`tests/test_golden_sql.py` 里的期望字符串逐条搬自 Go 仓库的
-`sqlbuilder_test.go`，跑 `pytest` 就是在验证两边产出同一份 SQL。另有 19 个用例打在真实
+`sqlbuilder_test.go`，另有 63 条跨语言语料自动对拍。当前还有 29 个用例打在真实
 MySQL 8.4 上，覆盖微秒时间戳落库、裸字节 BLOB、唯一键冲突、事务回滚、
 以及**按字段号改名后数据还在不在**。
 
@@ -92,8 +92,12 @@ import pymysql
 from proto2mysql import DB
 import example_pb2 as pb
 
+# autocommit=True：PyMySQL 默认是 False，那意味着连接从第一条语句起就一直待在
+# 一个**隐式事务**里——下面这些写操作全都不会落库（关连接时反而回滚掉）。
+# 启用缓存时会直接拒绝这种连接，避免未提交数据进入共享缓存。
+# 需要原子性的那一段用 db.transaction() 显式包起来。
 conn = pymysql.connect(host="localhost", user="root", password="...", database="testdb",
-                       charset="utf8mb4")
+                       charset="utf8mb4", autocommit=True)
 
 db = DB(conn, "testdb")
 
@@ -123,6 +127,26 @@ db.find_all_by_where(users, "`age` > ?", [20])
 # 删
 db.delete(result)
 ```
+
+高层写接口会把「同一个主键」和「只是撞了二级唯一键」分开处理：
+
+- `db.insert_ignore()` 发普通 `INSERT`，只把 MySQL 1062（重复键）当作“忽略”；
+  截断、类型错误、`NOT NULL` 等数据错误仍然抛出；
+- `db.save()` / `db.batch_save()` / `db.insert_on_dup_update()` 先按**完整主键**
+  `UPDATE`，未命中再 `INSERT`；若插入撞 1062，则重试同一个主键的 `UPDATE`，
+  最后按主键是否存在分类。二级 `UNIQUE` 撞到另一主键时会报重复键，绝不会改掉
+  那个 owner 的数据；
+- `batch_save()` 默认逐行执行，不自动承诺整批原子性；需要全成全败时用
+  `with db.transaction() as tx:` 包住。
+
+低层 `SQLBuilder` 只负责生成单条 SQL，无法执行上面的分类状态机；它用受保护的
+no-op ODKU 保证二级唯一键冲突时不改另一主键行。细节见
+[API 安全速查表](docs/api-safety.md)。
+
+> 不启用缓存时，也可以使用 `autocommit=False` 并显式调用 `db.commit()` / `db.rollback()`。
+> 但一旦调用 `enable_cache()`，已绑定连接必须同时满足：`dbname` 非空、
+> `autocommit=True`；不满足会直接拒绝，而不是冒险把未提交数据放进共享缓存。
+> 需要原子性时，在 autocommit 连接上使用 `db.transaction()`。
 
 ### 4. 自动注册（不用逐个 register_table）
 
@@ -187,9 +211,9 @@ cur.execute(*stmt.for_paramstyle("format"))
 |------|------|------|
 | INSERT | `insert` | 全字段插入 |
 | | `insert_set_fields` | 只插已赋值字段，其余交给列默认值（自增 id / `DEFAULT CURRENT_TIMESTAMP`） |
-| | `insert_ignore` / `insert_ignore_set_fields` | `INSERT IGNORE`，冲突跳过 |
+| | `insert_ignore` / `insert_ignore_set_fields` | 普通 `INSERT` + no-op ODKU；只跳过重复键，不吞其他数据错误 |
 | | `replace` | `REPLACE INTO`（先删后插） |
-| | `batch_insert` / `batch_insert_ignore` / `batch_replace` | 多行 VALUES |
+| | `batch_insert` / `batch_insert_ignore` / `batch_replace` | 多行 VALUES；ignore 版同样用 no-op ODKU |
 | UPSERT | `upsert(m, *cols)` | `ON DUPLICATE KEY UPDATE c = VALUES(c)`，覆盖 |
 | | `upsert_add(m, *cols)` | `c = c + VALUES(c)`，累加计数器 |
 | | `upsert_keep_old(m)` | `pk = pk`，插入或只加行锁不改数据 |
@@ -339,13 +363,15 @@ SELECT TO_BASE64(`player`) FROM `golang_test` WHERE `id` = 1;
 `update_table_field` / `sync_all_tables` / `generate_migration_sql` 同步结构时，会先读
 `information_schema` 的列类型与注释，按如下优先级对齐：
 
-1. **列名相同**：类型不兼容时 `MODIFY COLUMN` 对齐类型（并回填字段号注释）；
+1. **列名相同**：只自动执行可证明无损的拓宽、精度提升或属性放宽，并回填字段号注释；
 2. **列名不同但字段号相同**（即 proto 里把该字段改了名）：用
-   `CHANGE COLUMN 旧列名 新列名 新类型 COMMENT 'pb:N'` 改名并对齐类型，**原有数据保留**；
+   `CHANGE COLUMN` 改名；目标更窄时保留线上较宽类型，**原有数据保留**；
 3. **找不到对应列**：`ADD COLUMN` 新增。
 
-主键只补"从无到有"，**绝不自动 DROP/改写已有主键**；补主键与列变更放在同一条 ALTER 里
-（分开会撞 `Error 1075 auto column must be defined as a key`）。
+`TIMESTAMP`/`DATETIME`、跨类型族和不安全的 signed/unsigned 变化会直接 fail-closed，
+要求人工迁移。主键只补"从无到有"，**绝不自动 DROP/改写已有主键**。普通主键列变更
+先落地，依赖索引与 `ADD PRIMARY KEY` 再执行；只有含 `AUTO_INCREMENT` 的列子句必须与
+主键同句（否则 MySQL `Error 1075`）。这样也兼容 TiDB 不能在同句约束里引用新改列名的限制。
 
 ## 连库执行（DB）
 
@@ -372,7 +398,8 @@ with db.transaction() as tx:
 # 正常退出 → 提交
 ```
 
-启用缓存时，事务内的缓存失效**延迟到提交成功之后**执行（回滚不删缓存）。
+启用缓存时，事务内的缓存失效会延迟：回滚不删；一旦尝试 `COMMIT` 就保守删除，
+即使提交已经落库但 ACK 丢失、`commit()` 抛异常，也不会留下永久旧缓存。
 
 ### 缓存（cache-aside，可选）
 
@@ -382,14 +409,21 @@ db.enable_cache(my_redis_cache, ttl=300)
 
 - 读（`find_one_by_pk` / `find_or_create` 命中路径）：先查缓存，未命中读 DB 后回填；
 - 写（按主键的 save/update/delete/incr 等）：先写 DB，成功后删缓存；
-- 降级：缓存出错**仅记日志**，不影响 DB 结果（弱依赖）。
+- 降级：缓存后端的 `get/set/delete` 故障仅记日志；空库名、非 autocommit、外部事务或
+  managed transaction 中混用 cache backend 会在发送 typed SQL 前 fail-closed。
 
 按 WHERE 条件的更新/删除定位不到受影响主键，**不做缓存失效**——缓存表请优先用按主键的接口，
-或调用 `invalidate_cache()` 手动失效。
+或调用 `invalidate_cache()` 手动失效；在 managed transaction 内手动失效也会等到提交尝试后，
+回滚时不会误删仍有效的缓存。
 
 ## 离线生成 SQL（proto2sql 命令）
 
-不连库、不写 Python 代码，直接从 `.proto` 生成建表语句：
+不连库、不写 Python 代码，直接从 `.proto` 生成建表语句。基础安装已经包含
+`grpcio-tools`，安装后即可使用：
+
+```bash
+pip install proto2mysql
+```
 
 ```bash
 proto2sql -I proto -o schema.sql proto/account.proto
@@ -397,9 +431,16 @@ proto2sql -I proto -o schema.sql proto/account.proto
 
 只处理声明了 `option (proto2mysql.db) = true;` 的文件里、且带 `table_name` 的 message。
 
+`-o`（合并成一个文件）与 `--out-dir`（一张表一个文件）**二选一**。
+用 `--out-dir` 时表名要能安全地当文件名——带 `/`、`..`、盘符之类的表名会被直接拒掉，
+而不是把 `.sql` 写到目录外面去。
+多个输入文件的 **basename 必须互不相同**：protoc 只按文件名解析，同名的两个文件里
+只有靠前那个会被编译，另一个静默漏掉（现在会当场报错）。
+
 ## 与 Go 版的差异
 
-全部是刻意的，逐条说明。除第 1 条外都不影响生成的 SQL 文本。
+全部是刻意的，逐条说明。63 条核心语料仍逐字节一致；下面标明的安全分叉可能改变
+特定边界输入的 SQL，完整对拍口径见 [docs/testing.md](docs/testing.md#刻意的分叉语料钉在-go-的口径上)。
 
 ### 1. TEXT/BLOB 列上的索引会补前缀长度（**这是修 Go 版的 bug**）
 
@@ -467,6 +508,16 @@ Python(upb) 是稳定的。两边写出来的 blob **都能被对方正确解析
 
 见[类型映射](#类型映射)。本库保持与 Go 相同的行为而不是悄悄修掉——修了两边就产出不同的 DDL。
 
+### 8. 三处 SQL 安全加固
+
+- `repeated google.protobuf.Timestamp` 映射为 `MEDIUMBLOB`，与实际写入的 protobuf bytes 对称；
+- `save` / upsert 的低层 ODKU 每个赋值都带**完整复合主键的 NULL-safe guard**，
+  二级唯一键撞到不同主键时整条更新退化为 no-op；高层 `DB` 再用主键状态机把它分类成错误；
+- DDL `COMMENT` 的单引号使用 SQL 标准的 `''`，在 `NO_BACKSLASH_ESCAPES` 下仍能闭合。
+
+当前相邻 Go 工作树的 63 条核心 SQL 语料已逐字节一致；其余不进入 SQL 语料的行为差异
+仍由对拍工具和[测试说明](docs/testing.md)分别记账。
+
 ## 测试
 
 ```bash
@@ -477,9 +528,9 @@ pip install -e ".[dev]"
 pytest
 ```
 
-离线用例（126 个）不需要任何外部依赖，`.proto` 会在测试启动时现场编译。
+不给 DSN 时当前为 **396 passed, 29 skipped**；`.proto` 会在测试启动时现场编译。
 
-真库集成用例（19 个）默认跳过，给一个 DSN 就会跑：
+真库集成用例（29 个）默认跳过，给一个 DSN 就会跑：
 
 ```bash
 PROTO2MYSQL_DSN=mysql://root@127.0.0.1:3306/proto2mysql_test pytest tests/test_integration_mysql.py

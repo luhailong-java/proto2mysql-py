@@ -169,3 +169,116 @@ def test_no_banner_without_drop(tmp_path):
     body = out.read_text(encoding="utf-8")
     assert "DROP TABLE" not in body
     assert "危险" not in body
+
+
+# ── 落盘安全与输入解析 ───────────────────────────────────────────────────
+
+
+def test_out_path_refuses_to_escape_out_dir(tmp_path):
+    """表名来自 proto 选项，是**输入数据**不是常量。
+
+    带 `../` 或盘符就能把 .sql 写到 --out-dir 之外，而 `Path.__truediv__`
+    两种都不拦——`out_dir / "../../x.sql"` 会老老实实往上走。
+    """
+    from proto2mysql.tools.proto2sql import _out_path
+
+    assert _out_path(tmp_path, "account") == (tmp_path / "account.sql").resolve()
+    for bad in ("../evil", "a/b", "C:evil", "..", ""):
+        with pytest.raises(ValueError):
+            _out_path(tmp_path, bad)
+
+
+def test_cli_refuses_table_name_that_would_escape_out_dir(tmp_path):
+    src = tmp_path / "escape.proto"
+    src.write_text(
+        '''syntax = "proto3";
+import "proto2mysql_option.proto";
+message escape_probe {
+  option (proto2mysql.table_name) = "../evil";
+  uint64 id = 1;
+}
+''',
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "sql"
+
+    rc = proto2sql.main(
+        ["--out-dir", str(out_dir), "-I", str(OPTION_DIR), str(src)]
+    )
+
+    assert rc == 1
+    assert not (tmp_path / "evil.sql").exists()
+    assert not out_dir.exists(), "路径校验失败时必须一张文件都不落"
+
+
+def test_duplicate_basenames_are_refused(tmp_path):
+    """两个同名输入只有靠前那个会被 protoc 编译，另一个静默漏掉。
+
+    整条命令返回 0，产出的 schema 里少几张表，没有任何提示——
+    只有下次建表时报 Unknown table。
+    """
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    (tmp_path / "a" / "user.proto").write_text("syntax = \"proto3\";\n", encoding="utf-8")
+    (tmp_path / "b" / "user.proto").write_text("syntax = \"proto3\";\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as exc:
+        proto2sql.generate(
+            [str(tmp_path / "a" / "user.proto"), str(tmp_path / "b" / "user.proto")], []
+        )
+    assert "遮蔽" in str(exc.value)
+
+
+def test_output_and_out_dir_are_mutually_exclusive(tmp_path):
+    """两个都给时，早先是 --out-dir 静默胜出、-o 的文件一个字都不写，退出码还是 0。"""
+    from proto2mysql.tools.proto2sql import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(["-o", str(tmp_path / "x.sql"), "--out-dir", str(tmp_path), "dummy.proto"])
+    assert exc.value.code == 2
+
+
+def test_filename_relative_to_include_dir_is_accepted(tmp_path):
+    """protoc 的标准写法：文件名**相对 -I 目录**，本身不是一条可用路径。
+
+    `proto2sql -I proto account.proto` 是最常见的调用形式。
+    早先的同名遮蔽检查拿 `Path(pf).resolve()` 直接比，把这种写法一并拒了——
+    报的还是"会被遮蔽"，方向完全错。
+    """
+    from proto2mysql.tools.proto2sql import _resolve_inputs
+
+    (tmp_path / "proto").mkdir()
+    (tmp_path / "proto" / "user.proto").write_text('syntax = "proto3";\n', encoding="utf-8")
+    paths, names = _resolve_inputs(["user.proto"], [str(tmp_path / "proto")])
+    assert names == ["user.proto"]
+    assert str(tmp_path / "proto") in paths
+
+
+def test_base_install_includes_the_compiler_needed_by_installed_cli():
+    """基础安装会注册 proto2sql，因此它需要的 grpcio-tools 也必须在基础依赖里。"""
+    import re
+
+    # 项目声明支持 Python 3.10；tomllib 是 3.11 才进入标准库，测试自身不能偷偷
+    # 抬高最低版本。这里只需守住基础依赖项，限定读取 dependencies 数组即可。
+    pyproject = (TESTS.parent / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r"(?ms)^dependencies\s*=\s*\[(.*?)^\]", pyproject)
+    assert match is not None
+    assert re.search(r"['\"]grpcio-tools(?:[^'\"]*)['\"]", match.group(1), re.IGNORECASE)
+
+
+def test_help_survives_legacy_windows_stdout_encoding():
+    """argparse 的中文帮助也不能在 cp1252/cp936 控制台先于业务逻辑崩掉。"""
+    import os
+    import subprocess
+    import sys
+
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "cp1252"
+    proc = subprocess.run(
+        [sys.executable, "-m", "proto2mysql.tools.proto2sql", "--help"],
+        cwd=TESTS.parent,
+        env=env,
+        capture_output=True,
+    )
+    assert proc.returncode == 0, proc.stderr.decode("ascii", errors="replace")
+    assert b"UnicodeEncodeError" not in proc.stderr

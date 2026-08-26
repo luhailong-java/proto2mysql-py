@@ -14,8 +14,10 @@ import datetime as _dt
 import math
 import struct
 from decimal import Decimal
+from functools import lru_cache
 from typing import Any
 
+from google.protobuf import descriptor_pb2
 from google.protobuf.descriptor import FieldDescriptor
 from google.protobuf.message import Message
 
@@ -64,13 +66,78 @@ _INT_BITS = {
 }
 
 
+def is_repeated_field(fd: FieldDescriptor) -> bool:
+    """兼容 protobuf 5.x 与 7.x 判断 repeated。
+
+    protobuf 5.29 的 upb ``FieldDescriptor`` 只有 ``label``，没有
+    ``is_repeated``；新版提供 ``is_repeated``，而 ``label`` 已退出稳定 API。
+    先用新版属性，缺失时才回退到 descriptor proto 的稳定枚举值。
+    """
+    repeated = getattr(fd, "is_repeated", None)
+    if repeated is not None:
+        return bool(repeated)
+    return (
+        getattr(fd, "label", None)
+        == descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED
+    )
+
+
 def is_timestamp_field(fd: FieldDescriptor) -> bool:
     """判断字段是否为单值的 google.protobuf.Timestamp。"""
     return (
-        not fd.is_repeated
+        not is_repeated_field(fd)
         and fd.type == _T.TYPE_MESSAGE
         and fd.message_type is not None
         and fd.message_type.full_name == TIMESTAMP_FULL_NAME
+    )
+
+
+@lru_cache(maxsize=1024)
+def _proto3_optional_field_names(descriptor) -> frozenset:
+    """消息里哪些字段是 proto3 的 ``optional``（也就是**合成** oneof 的那些）。
+
+    upb 实现（protobuf 5/6/7 的默认实现）的 OneofDescriptor 没有 ``is_synthetic``、
+    Descriptor 也没有 ``real_oneofs``（7.35.1 实测两个都不存在）。唯一权威的判据
+    在 FieldDescriptorProto 的 ``proto3_optional`` 位上，只能 CopyToProto 取一次。
+
+    **别用名字启发式**（"只含一个字段且名字是 ``_<字段名>``"）。它两个方向都会错：
+
+    * 假阳性：``_<字段名>`` 与消息内已有名字冲突时，protoc 会把合成 oneof 改名成
+      ``X_<字段名>``——一份完全合法的 proto3 消息会被当成真 oneof 拒掉。
+      实测 ``message m { int64 id = 1; string _x = 2; optional int32 x = 3; }``
+      生成的 oneof 就叫 ``X_x``。
+    * 假阴性：真写一个 ``oneof _x { int32 x = 2; }``，名字恰好长得像合成的，
+      于是 fail-closed 的闸放它过去，回读照样损坏数据。
+
+    走注册期，不进热路径；lru_cache 给个上界，避免动态 pool 反复建时无界增长。
+    """
+    proto = descriptor_pb2.DescriptorProto()
+    descriptor.CopyToProto(proto)
+    return frozenset(f.name for f in proto.field if f.proto3_optional)
+
+
+def real_oneof(fd: FieldDescriptor):
+    """字段所属的**真** oneof；不在真 oneof 里返回 None。
+
+    proto3 的 ``optional`` 也会生成一个 oneof（**合成** oneof），不能一起算——
+    把它当真 oneof 会把 optional 字段的 has 位弄丢。判据见
+    :func:`_proto3_optional_field_names`。
+    """
+    oneof = fd.containing_oneof
+    if oneof is None:
+        return None
+    if fd.name in _proto3_optional_field_names(fd.containing_type):
+        return None
+    return oneof
+
+
+def _reject_real_oneof(fd: FieldDescriptor) -> None:
+    """拒绝行格式无法无损表示的真实 oneof 字段。"""
+    oneof = real_oneof(fd)
+    if oneof is None:
+        return
+    raise InvalidFieldKindError(
+        f"field {fd.full_name} belongs to unsupported oneof {oneof.full_name}"
     )
 
 
@@ -81,7 +148,7 @@ def is_map_field(fd: FieldDescriptor) -> bool:
     必须看 map_entry 选项——这与 Go 的 IsMap()/IsList() 是两个独立判定一致。
     """
     return (
-        fd.is_repeated
+        is_repeated_field(fd)
         and fd.type == _T.TYPE_MESSAGE
         and fd.message_type is not None
         and fd.message_type.GetOptions().map_entry
@@ -90,7 +157,7 @@ def is_map_field(fd: FieldDescriptor) -> bool:
 
 def is_list_field(fd: FieldDescriptor) -> bool:
     """判断字段是否为 repeated（不含 map）。"""
-    return fd.is_repeated and not is_map_field(fd)
+    return is_repeated_field(fd) and not is_map_field(fd)
 
 
 def has_field(message: Message, fd: FieldDescriptor) -> bool:
@@ -101,7 +168,7 @@ def has_field(message: Message, fd: FieldDescriptor) -> bool:
     - 有 presence 的标量（proto3 optional / proto2）：HasField
     - proto3 无 presence 的标量：非零值即已设置
     """
-    if fd.is_repeated:
+    if is_repeated_field(fd):
         return len(getattr(message, fd.name)) > 0
     if fd.has_presence:
         return message.HasField(fd.name)
@@ -225,24 +292,31 @@ def serialize_field_as_text(message: Message, fd: FieldDescriptor) -> Any:
 #
 # 缓存以 FieldDescriptor 为键：同一个 pool 里描述符是单例，可哈希且生命周期与进程一致。
 
-_TEXT_ENCODERS: dict[FieldDescriptor, Any] = {}
-_VALUE_ENCODERS: dict[FieldDescriptor, Any] = {}
+# 为什么是 lru_cache 而不是手写 dict 或 WeakKeyDictionary：
+#
+# 手写 dict 无界。descriptor 只有在 Default() pool 里才"生命周期与进程一致"；
+# 离线工具（tools/proto2sql 每批 proto 建一个独立 DescriptorPool）和服务热加载
+# proto 的场景下，每个用完即弃的 pool 都会往缓存里留一份，而缓存里留着 descriptor
+# 就把整个 pool 钉住不放——实测 300 个一次性 pool 留下 18000 条缓存，一个都没回收。
+#
+# WeakKeyDictionary 走不通：upb 的 FieldDescriptor 既不支持弱引用
+# （TypeError: cannot create weak reference to ...FieldDescriptor），也挂不上属性。
+#
+# 弱引用这条路没有，那就退而求其次给它一个上界。实测 lru_cache 比原来的
+# dict.get 包装还快一点（47.5ns vs 51.2ns/次），热路径不受影响。
+_ENCODER_CACHE_SIZE = 4096
 
 
+@lru_cache(maxsize=_ENCODER_CACHE_SIZE)
 def text_encoder(fd: FieldDescriptor):
     """取（并缓存）该字段的文本/字节编码闭包。"""
-    enc = _TEXT_ENCODERS.get(fd)
-    if enc is None:
-        enc = _TEXT_ENCODERS[fd] = _make_text_encoder(fd)
-    return enc
+    return _make_text_encoder(fd)
 
 
+@lru_cache(maxsize=_ENCODER_CACHE_SIZE)
 def value_encoder(fd: FieldDescriptor):
     """取（并缓存）该字段的 SQL 参数编码闭包（未设置的 Timestamp -> None）。"""
-    enc = _VALUE_ENCODERS.get(fd)
-    if enc is None:
-        enc = _VALUE_ENCODERS[fd] = _make_value_encoder(fd)
-    return enc
+    return _make_value_encoder(fd)
 
 
 def _make_value_encoder(fd: FieldDescriptor):
@@ -258,11 +332,12 @@ def _make_value_encoder(fd: FieldDescriptor):
 
 
 def _make_text_encoder(fd: FieldDescriptor):
+    _reject_real_oneof(fd)
     name = fd.name
 
     if is_timestamp_field(fd):
         return lambda m: _serialize_timestamp(m, fd)
-    if fd.is_repeated:  # map 和 list 都走容器序列化
+    if is_repeated_field(fd):  # map 和 list 都走容器序列化
         return lambda m: _serialize_container(m, fd)
 
     ftype = fd.type
@@ -340,6 +415,9 @@ def parse_from_row(message: Message, row) -> None:
     （SELECT 的列顺序由 MessageTable 按同一顺序生成，两边必须同源）。
     """
     fields = message.DESCRIPTOR.fields
+    # 先验证整张消息，再改调用方对象；否则 oneof 位于中段时会留下半行更新。
+    for fd in fields:
+        _reject_real_oneof(fd)
     count = min(len(fields), len(row))
     for i in range(count):
         set_field_from_raw(message, fields[i], row[i])
@@ -352,10 +430,12 @@ def set_field_from_raw(message: Message, fd: FieldDescriptor, raw: Any) -> None:
     按列类型返回 int / float / str / bytes / datetime / Decimal / None，
     这里先归一再走与 Go 相同的分支——比 Go 少一次"数字转字符串再转回数字"。
     """
+    _reject_real_oneof(fd)
+
     if is_timestamp_field(fd):
         _parse_timestamp(message, fd, raw)
         return
-    if fd.is_repeated:
+    if is_repeated_field(fd):
         _parse_container(message, fd, raw)
         return
 
@@ -390,7 +470,16 @@ def set_field_from_raw(message: Message, fd: FieldDescriptor, raw: Any) -> None:
         bits = _INT_BITS[ftype]
         kind = ("int" if signed else "uint") + str(bits)
         try:
-            value = int(Decimal(text)) if _looks_decimal(text) else int(text, 10)
+            if _looks_decimal(text):
+                # 驱动对 DECIMAL / 科学计数的列会给出带小数点的文本，整数值的照收；
+                # 但小数部分非零时**必须报错**而不是截断。Go 侧走 ParseInt，"1.9"
+                # 直接是 invalid syntax；这边静默截成 1，既丢数据又让两边读出不同的值。
+                dec = Decimal(text)
+                value = int(dec)
+                if dec != value:
+                    raise ValueError(f"value has a fractional part: {text}")
+            else:
+                value = int(text, 10)
         except (ValueError, ArithmeticError) as exc:
             raise ValueError(f"parse {kind} field {name}: {exc} (value: {text})") from exc
         _check_int_range(value, bits, signed, name, text)
@@ -399,9 +488,15 @@ def set_field_from_raw(message: Message, fd: FieldDescriptor, raw: Any) -> None:
     if ftype in (_T.TYPE_FLOAT, _T.TYPE_DOUBLE):
         kind = "float" if ftype == _T.TYPE_FLOAT else "double"
         try:
-            setattr(message, name, float(text))
+            value = float(text)
         except ValueError as exc:
             raise ValueError(f"parse {kind} field {name}: {exc} (value: {text})") from exc
+        if not math.isfinite(value):
+            raise NonFiniteFloatError(
+                "non-finite float value (NaN/Inf) cannot be loaded from MySQL: "
+                f"field {name} = {text}"
+            )
+        setattr(message, name, value)
         return
     if ftype == _T.TYPE_BOOL:
         setattr(message, name, _parse_bool(text, name))
@@ -459,8 +554,22 @@ def _parse_datetime_text(text: str, field_name: str) -> _dt.datetime:
 
 
 def _parse_container(message: Message, fd: FieldDescriptor, raw: Any) -> None:
-    """反序列化 map/list 字段（_serialize_container 的逆操作）。"""
+    """反序列化 map/list 字段（_serialize_container 的逆操作）。
+
+    **无论这一列是什么值，目标容器都要先清空**，理由与 _parse_timestamp 同一条：
+    查询接口一律是"传入实例、写回同一实例"，复用实例是常规用法（拿同一个 msg 换主键
+    连查几行）。早先只有 list 的非空分支清了，另外两条路都不清：
+
+    * 列是 NULL / 空 → 直接 return，上一行的 repeated 原样留着；
+    * map → 只 MergeFrom，上一行的键与这一行的键**合并**成一份。
+
+    于是查第二个玩家会读出第一个玩家的背包，且全程不报错。
+
+    清空放在解析**成功之后**：解析一旦失败就原样抛出，不能顺手把调用方已有的数据
+    先清掉（与 _cache_get_proto 里"解析到临时对象再拷回去"是同一条取舍）。
+    """
     if raw is None or raw == "" or raw == b"":
+        message.ClearField(fd.name)
         return
     data = _as_bytes(raw)
     holder = message.__class__()
@@ -469,15 +578,12 @@ def _parse_container(message: Message, fd: FieldDescriptor, raw: Any) -> None:
     except Exception as exc:
         raise ValueError(f"parse field {fd.name}: {exc} ({len(data)} bytes)") from exc
 
+    # 与 Go 的 Truncate(0) 一致：覆盖而不是追加。map 用 ClearField 一并覆盖到。
+    message.ClearField(fd.name)
     src = getattr(holder, fd.name)
     if len(src) == 0:
         return
-    dst = getattr(message, fd.name)
-    if is_map_field(fd):
-        dst.MergeFrom(src)
-        return
-    del dst[:]  # 与 Go 的 Truncate(0) 一致：覆盖而不是追加
-    dst.MergeFrom(src)
+    getattr(message, fd.name).MergeFrom(src)
 
 
 #: NULL / 空串列在读回时要重置成默认值的标量类型。

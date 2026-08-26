@@ -51,7 +51,8 @@ def test_parse_mysql_type(text, base, length, decimal, unsigned):
         ("float", "double", False),  # 线上更窄，必须拓宽
         ("double", "float", True),  # 线上更宽，不动它
         ("mediumtext", "MEDIUMTEXT", True),  # 大小写无关
-        ("timestamp", "datetime(6)", False),  # 精度不足必须 ALTER
+        ("timestamp", "datetime(6)", False),  # 精度不足且时间语义不同
+        ("timestamp(6)", "datetime(6)", False),  # 同精度仍是不同时间/时区语义
         ("datetime", "DATETIME(6)", False),  # DATETIME(0) 必须升到 (6)
         ("datetime(6)", "DATETIME(6)", True),
         ("datetime(6)", "DATETIME(3)", True),  # 线上精度更高时不动它（降精度会丢数据）
@@ -391,3 +392,349 @@ def test_suppressed_narrowing_leaves_a_trace(testpb, caplog):
     traces = [r.getMessage() for r in caplog.records if "保持线上的不动" in r.getMessage()]
     assert traces, "挡下收窄必须留一条日志"
     assert "port" in traces[0] and "bigint unsigned" in traces[0]
+
+
+# ── oneof / repeated Timestamp（建表期 fail-closed） ──────────────────────
+
+
+def test_oneof_message_is_rejected_at_registration(kitchenpb):
+    """含真 oneof 的消息一律拒绝建表——本库表达不了它。
+
+    每个成员各占一列，而行里**没有判别位**：回读逐列 set，最后一个非默认列胜出，
+    于是写进去的激活成员会被静默换成别的成员（真库实测：写 b='hello' 读回 c）。
+    激活成员的值恰好等于默认值时更是谁也还原不出来。
+
+    与拒绝 sint32 / fixed32 同一个立场：不存在"既有正确用法"，
+    每一次回读都在损坏数据，宁可在注册时就拦下。
+    """
+    from proto2mysql import MessageTable
+    from proto2mysql.errors import InvalidFieldKindError
+
+    with pytest.raises(InvalidFieldKindError) as exc:
+        MessageTable.from_message(kitchenpb.one_of_probe)
+    assert "oneof" in str(exc.value)
+
+
+def test_proto3_optional_is_not_rejected(kitchenpb):
+    """proto3 的 optional 走的是**合成** oneof（只有一个成员、名字是 _<字段名>），
+    不能跟真 oneof 一起拒——那会把整张 kitchen_sink 挡在门外。
+    """
+    from proto2mysql import MessageTable
+
+    table = MessageTable.from_message(kitchenpb.kitchen_sink)
+    assert table.has_field("opt_score")
+
+
+def test_repeated_timestamp_is_a_blob_not_datetime(kitchenpb):
+    """`repeated Timestamp` 必须建成 MEDIUMBLOB。
+
+    早先 Timestamp 判定写在 is_repeated 之前，于是它被建成 DATETIME(6)；
+    而写入侧 pbconv.is_timestamp_field 带着 `not fd.is_repeated`，同一个字段
+    在那边算容器、写下去的是 proto wire 裸字节——STRICT 下每次写入都被 1292 拒。
+    """
+    from proto2mysql import MessageTable
+
+    table = MessageTable.from_message(kitchenpb.stamped_probe)
+    assert table.get_mysql_field_type(table.field("stamps")) == "MEDIUMBLOB"
+    assert table.get_mysql_field_type(table.field("stamp_map")) == "MEDIUMBLOB"
+    # 单个 Timestamp 不受影响
+    assert table.get_mysql_field_type(table.field("single")) == "DATETIME(6)"
+
+
+# ── 列属性漂移（COLUMN_TYPE 里看不见的那三样） ────────────────────────────
+
+
+def _aligned(testpb, **overrides):
+    """golang_test 完全对齐时的线上列元信息，可按列名覆盖其中一条。"""
+    cols = {
+        "id": ColumnMeta("int unsigned", 1, nullable=False, auto_increment=True),
+        "ip": ColumnMeta("mediumtext", 2, nullable=True),
+        "port": ColumnMeta("int unsigned", 3, nullable=False, default="0"),
+        "group_id": ColumnMeta("int unsigned", 4, nullable=False, default="0"),
+        "player": ColumnMeta("mediumblob", 5, nullable=True),
+        "player_id": ColumnMeta("bigint unsigned", 6, nullable=False, default="0"),
+    }
+    cols.update(overrides)
+    return cols
+
+
+def test_aligned_columns_produce_no_clauses(testpb):
+    assert table(testpb).build_alter_clauses(_aligned(testpb)) == []
+
+
+def test_missing_auto_increment_is_detected(testpb):
+    """线上列丢了 AUTO_INCREMENT，COLUMN_TYPE 一个字都看不出来。
+
+    后果很具体：不带主键值的 insert 会全部写 0，第二条就撞 Error 1062。
+    """
+    cols = _aligned(testpb, id=ColumnMeta("int unsigned", 1, nullable=False, auto_increment=False))
+    clauses = table(testpb).build_alter_clauses(cols)
+    assert clauses == ["MODIFY COLUMN `id` int unsigned NOT NULL AUTO_INCREMENT COMMENT 'pb:1'"]
+
+
+def test_online_not_null_where_proto_wants_nullable_is_widened(testpb):
+    """线上 NOT NULL 而 proto 要可空——放宽值域，无损，自动改。
+
+    Timestamp 列必然落在这一类：get_mysql_field_type 恒返回不带 NOT NULL 的
+    DATETIME(6)，线上一旦被谁改成 NOT NULL，凡是没赋值该字段的行就全部插不进去。
+    """
+    cols = _aligned(testpb, ip=ColumnMeta("mediumtext", 2, nullable=False))
+    assert table(testpb).build_alter_clauses(cols) == [
+        "MODIFY COLUMN `ip` MEDIUMTEXT COMMENT 'pb:2'"
+    ]
+
+
+def test_online_nullable_where_proto_wants_not_null_is_reported_not_changed(testpb, caplog):
+    """反方向是**收紧**：线上很可能已经有 NULL 行，只报不改。"""
+    cols = _aligned(testpb, port=ColumnMeta("int unsigned", 3, nullable=True, default="0"))
+    with caplog.at_level("WARNING"):
+        assert table(testpb).build_alter_clauses(cols) == []
+    assert any("NOT NULL" in r.getMessage() for r in caplog.records)
+
+
+def test_default_drift_is_reported_not_changed(testpb, caplog):
+    cols = _aligned(testpb, port=ColumnMeta("int unsigned", 3, nullable=False, default="7"))
+    with caplog.at_level("WARNING"):
+        assert table(testpb).build_alter_clauses(cols) == []
+    assert any("默认值" in r.getMessage() for r in caplog.records)
+
+
+def test_unwanted_live_default_is_reported_not_changed(kitchenpb, caplog):
+    """目标没有 DEFAULT、线上却有表达式默认值，也属于可见漂移。"""
+    from proto2mysql import MessageTable
+
+    t = MessageTable.from_message(kitchenpb.kitchen_sink)
+    live = {
+        "created_at": ColumnMeta(
+            "datetime(6)", 11, nullable=True, default="CURRENT_TIMESTAMP(6)"
+        )
+    }
+
+    with caplog.at_level("WARNING"):
+        clauses = t.build_alter_clauses(live)
+    assert not any("`created_at`" in clause for clause in clauses)
+    assert any(
+        "默认值" in record.getMessage() and "CURRENT_TIMESTAMP(6)" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_timestamp_to_datetime_semantics_drift_fails_closed(kitchenpb):
+    """同精度也不能把线上 TIMESTAMP 静默视作目标 DATETIME 已对齐。
+
+    两者的时区转换、2038 上限和存储语义不同。自动 MODIFY 会在当前 session
+    time_zone 下转换历史值，库无法证明安全；空 migration 又会让漂移永久存在。
+    公共 schema diff 必须直接拒绝并要求人工迁移。
+    """
+    from proto2mysql import MessageTable
+    from proto2mysql.errors import Proto2MySQLError
+
+    t = MessageTable.from_message(kitchenpb.kitchen_sink)
+    live = {
+        fd.name: ColumnMeta(t.get_mysql_field_type(fd), fd.number)
+        for fd in t.fields
+    }
+    live["created_at"] = ColumnMeta("timestamp(6)", 11, nullable=True)
+
+    with pytest.raises(Proto2MySQLError, match="TIMESTAMP.*DATETIME|DATETIME.*TIMESTAMP") as exc:
+        t.build_alter_clauses(live)
+    assert "人工" in str(exc.value)
+    assert "time_zone" in str(exc.value)
+
+
+def test_column_meta_without_extended_info_skips_attribute_checks(testpb):
+    """两参构造的 ColumnMeta（跨语言对拍语料、老调用方）一律不参与属性比较。
+
+    默认成"猜一个值"的话，语料里每一列都会被判成属性漂移、凭空长出 MODIFY 子句，
+    对拍当场崩——所以这三项必须是三态，None 表示"不知道，别比"。
+    """
+    cols = {
+        "id": ColumnMeta("int unsigned", 1),
+        "ip": ColumnMeta("mediumtext", 2),
+        "port": ColumnMeta("int unsigned", 3),
+        "group_id": ColumnMeta("int unsigned", 4),
+        "player": ColumnMeta("mediumblob", 5),
+        "player_id": ColumnMeta("bigint unsigned", 6),
+    }
+    assert table(testpb).build_alter_clauses(cols) == []
+
+
+# ── 改名 / 注释回填 / 属性补齐都不许顺手收窄（P0） ──────────────────────
+
+
+@pytest.mark.parametrize(
+    ("current", "target", "aligned"),
+    [
+        # 目标更窄 -> 保留线上的**类型本体**，但带上目标的属性
+        ("bigint unsigned", "int unsigned NOT NULL DEFAULT 0",
+         "bigint unsigned NOT NULL DEFAULT 0"),
+        ("mediumtext", "varchar(255)", "mediumtext"),
+        ("varchar(64)", "varchar(32)", "varchar(64)"),
+        ("double", "float NOT NULL DEFAULT 0", "double NOT NULL DEFAULT 0"),
+        ("datetime(6)", "DATETIME(0)", "datetime(6)"),
+        # 目标更宽或同宽 -> 原样用目标
+        ("int unsigned", "bigint unsigned NOT NULL DEFAULT 0",
+         "bigint unsigned NOT NULL DEFAULT 0"),
+        ("varchar(64)", "MEDIUMTEXT", "MEDIUMTEXT"),
+        ("float", "double NOT NULL DEFAULT 0", "double NOT NULL DEFAULT 0"),
+        ("int unsigned", "int unsigned NOT NULL DEFAULT 0", "int unsigned NOT NULL DEFAULT 0"),
+        # 有无符号翻面不是宽窄问题，照目标走
+        ("int", "int unsigned NOT NULL DEFAULT 0", "int unsigned NOT NULL DEFAULT 0"),
+    ],
+)
+def test_aligned_column_type(current, target, aligned):
+    """属性必须来自**目标**（NOT NULL / DEFAULT / AUTO_INCREMENT 是 proto 侧的决定，
+    COLUMN_TYPE 里根本没有它们），类型本体在目标更窄时来自**线上**。
+
+    紧跟类型本体的那个 unsigned 要一起丢掉，否则会拼出 `bigint unsigned unsigned`。
+    """
+    from proto2mysql.table import aligned_column_type
+
+    assert aligned_column_type(current, target) == aligned
+
+
+def test_comment_backfill_never_narrows(testpb):
+    """回填 `pb:N` 注释是"因为别的原因"要发 MODIFY 的典型场合。
+
+    线上被 DBA 拓宽成 bigint、类型本来兼容（`is_type_match` 为真），只是注释缺了——
+    早先这条 MODIFY 会带着 proto 的 `int unsigned` 一起下去，把列**收窄**回去。
+    """
+    cols = _aligned(testpb, player_id=ColumnMeta("bigint unsigned", 0, nullable=False, default="0"))
+    cols["port"] = ColumnMeta("bigint unsigned", 0, nullable=False, default="0")
+    clauses = table(testpb).build_alter_clauses(cols)
+    assert clauses == [
+        "MODIFY COLUMN `port` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:3'",
+        "MODIFY COLUMN `player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:6'",
+    ]
+
+
+def test_attribute_fix_never_narrows(testpb):
+    """补属性同理：线上 id 被拓宽成 bigint 且丢了 AUTO_INCREMENT，
+    补回自增不能顺手把 bigint 写成 int。"""
+    cols = _aligned(
+        testpb, id=ColumnMeta("bigint unsigned", 1, nullable=False, auto_increment=False)
+    )
+    assert table(testpb).build_alter_clauses(cols) == [
+        "MODIFY COLUMN `id` bigint unsigned NOT NULL AUTO_INCREMENT COMMENT 'pb:1'"
+    ]
+
+
+def test_rename_never_narrows(testpb):
+    """改名必须发 CHANGE COLUMN，MySQL 会借着它把整列数据真的搬到新类型上。
+
+    早先改名这条路**只判同族、不判方向**：同一个 proto 改动顺手改个名，
+    就从"什么都不做"变成把 5000000000 静默截成 4294967295（非严格模式），
+    或者整条 ALTER 失败让服务起不来（严格模式）。
+    """
+    cols = _aligned(testpb)
+    cols.pop("group_id")
+    # pb:4 在线上叫 legacy 且被拓宽成了 bigint，proto 要的是 int
+    cols["legacy"] = ColumnMeta("bigint unsigned", 4, nullable=False, default="0")
+    assert table(testpb).build_alter_clauses(cols) == [
+        "CHANGE COLUMN `legacy` `group_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:4'"
+    ]
+
+
+@pytest.mark.parametrize("current_type", ["int unsigned", "bigint unsigned"])
+def test_rename_by_field_number_rejects_signedness_changes(kitchenpb, current_type):
+    """字段号相同也不能把 unsigned 列顺手改成 signed。
+
+    ``kitchen_sink.zone_id`` 是 signed int、字段号 3。线上 ``old_port`` 若是
+    unsigned，生成 ``CHANGE ... int`` 会同时翻转值域；其中 bigint unsigned → int
+    还会收窄。两种都必须 fail-closed，不能把现存数据交给 MySQL 隐式转换。
+    """
+    from proto2mysql import ColumnMeta, MessageTable
+    from proto2mysql.errors import FieldNumberReusedError
+
+    target = MessageTable.from_message(kitchenpb.kitchen_sink)
+    with pytest.raises(FieldNumberReusedError, match="符号|unsigned|转换"):
+        target.build_alter_clauses({"old_port": ColumnMeta(current_type, 3)})
+
+
+def test_generated_index_names_fit_mysql_identifier_limit(testpb):
+    """合法的 64 字符表名不能因为自动添加 idx_/uk_ 前缀而生成非法 DDL。"""
+    import re
+
+    from proto2mysql import MessageTable, with_indexes, with_primary_key, with_table_name, with_unique_key
+
+    long_table_name = "t" * 64
+    opts = [
+        with_table_name(long_table_name),
+        with_primary_key("id"),
+        with_indexes("port", "group_id"),
+        with_unique_key("ip"),
+    ]
+    sql = MessageTable.from_message(testpb.golang_test, opts).get_create_table_sql()
+    names = re.findall(r"(?:INDEX|UNIQUE KEY) `([^`]+)`", sql)
+
+    assert len(names) == 3
+    assert len(set(names)) == 3
+    assert all(len(name) <= 64 for name in names)
+    # 名称必须稳定，不能用 Python 的随机化 hash()。
+    assert sql == MessageTable.from_message(testpb.golang_test, opts).get_create_table_sql()
+
+
+# ── 主键列的属性判定（自审发现的 P0） ────────────────────────────────────
+
+
+def test_primary_key_column_never_demands_nullable(kitchenpb):
+    """**主键列在 MySQL 里恒为 NOT NULL**，不能拿"proto 要可空"去要求它。
+
+    combo_key 的主键含 string 列 provider，映射成不带 NOT NULL 的 MEDIUMTEXT。
+    早先会判成"线上 NOT NULL 而 proto 要可空"→ 发一条 MODIFY → MySQL 照旧保持
+    NOT NULL → 下次启动再发一遍……**无休止**。开了 expand_only 更糟：
+    每次启动都抛 ExpandOnlyViolationError，服务永远起不来。
+    """
+    from proto2mysql import MessageTable
+
+    t = MessageTable.from_message(kitchenpb.combo_key)
+    live = {
+        "user_id": ColumnMeta("bigint unsigned", 1, nullable=False, default="0"),
+        # 主键列，MySQL 强制 NOT NULL —— 而 proto 的目标类型是裸 MEDIUMTEXT
+        "provider": ColumnMeta("mediumtext", 2, nullable=False),
+        "score": ColumnMeta("bigint", 3, nullable=False, default="0"),
+    }
+    assert t.build_alter_clauses(live) == []
+    # 非主键的同型列则照常要求可空
+    assert "MODIFY COLUMN `score`" not in "".join(t.build_alter_clauses(live))
+
+
+def test_timestamp_attribute_drift_is_not_used_to_bypass_fail_closed(kitchenpb):
+    """即使还有 NULL 属性漂移，也不能借 MODIFY 顺手翻转时间语义。"""
+    from proto2mysql import MessageTable
+    from proto2mysql.errors import Proto2MySQLError
+
+    t = MessageTable.from_message(kitchenpb.kitchen_sink)
+    live = {"created_at": ColumnMeta("timestamp(6)", 11, nullable=False)}
+
+    with pytest.raises(Proto2MySQLError, match="拒绝自动迁移"):
+        t.build_alter_clauses(live)
+
+
+# ── 合成 oneof 的判据：只能看 proto3_optional，不能看名字 ─────────────────
+
+
+def test_synthetic_oneof_with_colliding_name_is_allowed(kitchenpb):
+    """`_<字段名>` 与消息里已有的名字冲突时，protoc 把合成 oneof 改名成 `X_<字段名>`。
+
+    按名字判的话，这份**完全合法**的 proto3 消息会被 fail-closed 的闸硬拒——
+    一份改动前能正常注册的 proto，升级之后建不了表了。
+    """
+    from proto2mysql import MessageTable
+
+    md = kitchenpb.oneof_name_collision.DESCRIPTOR
+    assert [o.name for o in md.oneofs] == ["X_x"], "前提：protoc 确实改名了"
+    table = MessageTable.from_message(kitchenpb.oneof_name_collision)
+    assert table.has_field("x") and table.has_field("_x")
+
+
+def test_real_oneof_named_like_a_synthetic_one_is_still_rejected(kitchenpb):
+    """反方向：真写一个 `oneof _x { int32 x = 2; }`，名字恰好长得像合成的。
+
+    按名字判会把它放过去，而它每次回读都在损坏数据。
+    """
+    from proto2mysql import MessageTable
+    from proto2mysql.errors import InvalidFieldKindError
+
+    with pytest.raises(InvalidFieldKindError):
+        MessageTable.from_message(kitchenpb.fake_synthetic_oneof)

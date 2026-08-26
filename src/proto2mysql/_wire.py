@@ -52,6 +52,12 @@ def scan_fields(buf: bytes) -> dict[int, object]:
     但跳过逻辑必须正确，否则后面的字段号会全部错位。
 
     重复字段取最后一次出现的值，与 protobuf 合并语义一致。
+
+    **任何解析不下去的字节都抛 ValueError，绝不返回"解了一半"的结果。**
+    判断"要不要因此失败"是**调用方**的事：options.range_extensions 在运行期
+    选择吞掉这个异常并降级（打一条 warning），因为一份坏 option 不该打断
+    register_all_tables 的整轮注册。但本函数自己绝不静默——静默截断的后果是
+    option 被读成空 → 表名退化成 proto full name、主键凭空消失，一声不吭。
     """
     out: dict[int, object] = {}
     pos = 0
@@ -78,10 +84,17 @@ def scan_fields(buf: bytes) -> dict[int, object]:
             if depth == 0:
                 out[field_num] = raw
         elif wire_type == _WIRE_FIXED64:
+            # 必须显式查长度：Python 的切片越界只会**悄悄给短一截**，
+            # 随后 pos += 8 直接跨过 end，while 条件不成立、循环正常结束，
+            # 于是一段被截断的字节看起来解析成功了。
+            if pos + 8 > end:
+                raise ValueError("truncated fixed64")
             if depth == 0:
                 out[field_num] = buf[pos : pos + 8]
             pos += 8
         elif wire_type == _WIRE_FIXED32:
+            if pos + 4 > end:
+                raise ValueError("truncated fixed32")
             if depth == 0:
                 out[field_num] = buf[pos : pos + 4]
             pos += 4
@@ -93,5 +106,10 @@ def scan_fields(buf: bytes) -> dict[int, object]:
                 raise ValueError("unbalanced group")
         else:
             raise ValueError(f"unknown wire type {wire_type}")
+
+    if depth != 0:
+        # 没闭合的 group 意味着后面所有字段都被当成"组内"丢掉了，
+        # 而丢掉是静默的——返回的 dict 看起来只是"这些 option 没设置"。
+        raise ValueError("unclosed group")
 
     return out
