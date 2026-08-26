@@ -232,6 +232,38 @@ def is_rename_convertible(current_type: str, target_type: str) -> bool:
     return any(current_base in family and target_base in family for family in _FAMILIES)
 
 
+def narrowing_suppressed(current_type: str, target_type: str) -> bool:
+    """本次"判为兼容"是不是**因为挡下了一次收窄**（而不是两边本来就一样）。
+
+    专门用来打日志。收窄抑制是本库唯一一个「什么都不做、也什么都不说」的分支：
+    改名有 WARNING、expand_only 违规有带语句清单的报错，唯独这里一声不吭——
+    于是有人在 proto 里把 bigint 改回 int、期待列跟着变窄，结果什么也没发生，
+    也没有任何线索告诉他为什么。
+
+    判据：类型确实不同，且线上那一侧更宽。
+    """
+    current = parse_mysql_type(current_type)
+    target = parse_mysql_type(target_type)
+    current_base = _base_of(current)
+    target_base = _base_of(target)
+
+    if current_base != target_base:
+        for family in _FAMILIES:
+            c, t = family.get(current_base), family.get(target_base)
+            if c is None or t is None:
+                continue
+            if family is _INT_RANK and current.unsigned != target.unsigned:
+                return False  # 值域方向不同，不是宽窄问题
+            return c > t
+        return False
+
+    if current_base in ("varchar", "char") or current_base == "datetime":
+        return current.length > target.length
+    if current_base in _FLOAT_RANK:
+        return current.decimal > target.decimal
+    return False
+
+
 def is_type_match(current_type: str, target_type: str) -> bool:
     """判断线上列类型与目标类型是否兼容（不兼容才需要 MODIFY COLUMN）。
 
@@ -613,6 +645,15 @@ class MessageTable:
                 if not is_type_match(meta.col_type, target_type) or meta.field_num != fd.number:
                     alter_sqls.append(
                         f"MODIFY COLUMN {escape_mysql_name(field_name)} {target_type}{comment}"
+                    )
+                elif narrowing_suppressed(meta.col_type, target_type):
+                    # 什么都不做，但必须留痕：否则有人把 bigint 改回 int、期待列变窄，
+                    # 结果什么也没发生，也没有任何线索告诉他为什么。
+                    log.info(
+                        "table %s: 列 %s 线上是 %s、proto 要 %s——**保持线上的不动**。"
+                        "收窄会丢数据，且在滚动发布期间会被新旧副本来回改。"
+                        "确实要收窄请人工写 ALTER。",
+                        self.table_name, field_name, meta.col_type, target_type,
                     )
                 del remaining[field_name]
                 continue

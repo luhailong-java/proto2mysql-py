@@ -563,8 +563,8 @@ def test_sync_backfills_missing_indexes(indexed_db, conn, testpb):
     conn.queue_rows(
         [(1,)],  # 表存在
         ALIGNED_COLS,  # 列已对齐
-        [(1,)],  # 有主键
         [],  # 既有索引：一个都没有
+        [(1,)],  # 有主键
     )
     indexed_db.create_or_update_table(testpb.golang_test)
     alter = next(s for s, _ in conn.executed if s.startswith("ALTER TABLE `golang_test`"))
@@ -578,8 +578,8 @@ def test_sync_skips_existing_indexes(indexed_db, conn, testpb):
     conn.queue_rows(
         [(1,)],
         ALIGNED_COLS,
-        [(1,)],
         [("idx_golang_test_0",), ("uk_golang_test",), ("idx_dba_added_by_hand",)],
+        [(1,)],
     )
     indexed_db.create_or_update_table(testpb.golang_test)
     assert not [s for s, _ in conn.executed if s.startswith("ALTER TABLE")], "全都在，不该发 ALTER"
@@ -712,3 +712,120 @@ def test_explicit_table_name_does_not_warn(db, conn, testpb, caplog):
     with caplog.at_level("WARNING", logger="proto2mysql"):
         db._sync_table_schema(testpb.golang_test.DESCRIPTOR.full_name, table)
     assert not [r for r in caplog.records if "table_name" in r.getMessage()]
+
+
+# ── 并发边界（docs/concurrency.md） ──────────────────────────────────────
+#
+# 这一组测的是「P2MC 管什么、不管什么」。其中"丢失更新"那条是**故意断言坏行为**：
+# 它不是 bug，是整行 save 的固有语义；写成测试是为了把这个失败模式钉死在代码里，
+# 免得有人以为加了 ODKU 就万事大吉。
+
+
+def test_save_does_not_touch_columns_this_process_does_not_know(db, conn, testpb):
+    """v2 独有的列不会被 v1 的 save 清零——ODKU 只更新点名的列。"""
+    db.save(testpb.golang_test(id=7, ip="a"))
+    sql = conn.last_sql()
+    assert "ON DUPLICATE KEY UPDATE" in sql
+    # 本进程认识的列都在 SET 子句里
+    for col in ("id", "ip", "port", "group_id", "player", "player_id"):
+        assert f"`{col}` = VALUES(`{col}`)" in sql
+    # 而"本进程不认识的列"根本不会出现——列清单来自 descriptor，不是 information_schema
+    assert "level" not in sql
+
+
+def test_lost_update_on_shared_field_is_not_prevented(db, conn, testpb):
+    """**共同字段的丢失更新，本库不防**，这是整行 save 的固有语义。
+
+    时序（docs/concurrency.md 第三节）：
+
+        T1 v1 读到 port=100
+        T2 v2 把 port 改成 200 并 save
+        T3 v1 只想改 ip，却用了整行 save —— 它手里的 port 还是 100
+        → port=200 被盖回 100
+
+    要防必须自己选：update_fields_by_pk / incr_by_pk / 乐观锁 / 行锁。
+    """
+    stale = testpb.golang_test(id=7, ip="Bob", port=100)  # v1 手里的旧快照
+    db.save(stale)
+    sql, args = conn.executed[-1]
+    # port 确实被写进去了——哪怕调用方只想改 ip
+    assert "`port` = VALUES(`port`)" in sql
+    assert "100" in [str(a) for a in args], "整行 save 会把手里的旧 port 一起写回去"
+
+
+def test_update_fields_by_pk_avoids_lost_update(db, conn, testpb):
+    """只改一两个字段时的正确姿势：不碰别人改过的共同字段。"""
+    db.update_fields_by_pk(testpb.golang_test(id=7, ip="Bob"), "ip")
+    sql = conn.last_sql()
+    assert sql == "UPDATE `golang_test` SET `ip` = %s WHERE `id` = %s"
+    assert "port" not in sql, "没点名的列一个都不该出现"
+
+
+def test_transaction_bypasses_cache_on_read(db, conn, testpb):
+    """事务内**完全绕过缓存**——要读到事务内自己刚写的最新值，走缓存就错了。
+
+    这也是"缓存机制本身不会把未提交数据写进缓存"的一半原因，
+    另一半是失效延迟到提交成功之后（见 test_cache_invalidation_deferred_until_commit）。
+    """
+    cache = DictCache()
+    db.enable_cache(cache)
+    table = db.tables[testpb.golang_test.DESCRIPTOR.full_name]
+
+    # 缓存里先放一条能命中的
+    cached = testpb.golang_test(id=9, ip="from-cache")
+    cache.set(db.cache_key(cached), encode_entry(table.field_numbers, cached.SerializeToString()), None)
+
+    # 事务外：命中缓存，不查库
+    out = testpb.golang_test(id=9)
+    db.find_one_by_pk(out)
+    assert out.ip == "from-cache"
+    assert not [s for s, _ in conn.executed if s.startswith("SELECT `id`")]
+
+    # 事务内：必须绕过缓存去查库
+    conn.queue_rows([(9, "from-db-in-tx", 0, 0, b"", 0)])
+    with db.transaction() as tx:
+        out2 = testpb.golang_test(id=9)
+        tx.find_one_by_pk(out2)
+    assert out2.ip == "from-db-in-tx", "事务内不该读缓存"
+    assert [s for s, _ in conn.executed if s.startswith("SELECT `id`")], "事务内必须真的查库"
+
+
+def test_transaction_does_not_write_uncommitted_data_into_cache(db, conn, testpb):
+    """事务内的读不回填缓存——否则未提交的数据会漏进缓存，回滚也收不回来。"""
+    cache = DictCache()
+    db.enable_cache(cache)
+
+    conn.queue_rows([(9, "in-tx", 0, 0, b"", 0)])
+    with db.transaction() as tx:
+        tx.find_one_by_pk(testpb.golang_test(id=9))
+    assert len(cache) == 0, "事务内的读不该回填缓存"
+
+
+def test_for_update_outside_transaction_is_refused(db, testpb):
+    """FOR UPDATE 只在事务内有意义：事务外单句自动提交，锁立刻释放，等于没加。
+
+    库对这条做硬校验而不是静默失效——静默失效的锁比没有锁更危险。
+    """
+    with pytest.raises(Proto2MySQLError):
+        db.find_one_by_pk_for_update(testpb.golang_test(id=1))
+
+
+def test_optimistic_lock_detects_conflict(db, conn, testpb):
+    """乐观锁：版本对不上就返回 False，由调用方决定重试还是报错。"""
+    msg = testpb.golang_test(id=7, ip="x", group_id=3)
+    conn.next_rowcount = 1
+    assert db.update_if_version(msg, "group_id") is True
+
+    conn.next_rowcount = 0  # 版本已被别人改走
+    assert db.update_if_version(msg, "group_id") is False
+
+
+def test_atomic_decrement_needs_no_read(db, conn, testpb):
+    """计数类走数据库端原子运算，根本不需要先读——从源头上没有丢失更新的窗口。"""
+    conn.next_rowcount = 0
+    assert db.decr_by_pk_if_enough(testpb.golang_test(id=7), "port", 5) is False
+    assert conn.last_sql() == (
+        "UPDATE `golang_test` SET `port` = `port` - %s WHERE `id` = %s AND `port` >= %s"
+    )
+    # 关键：语句里没有任何"先读出来的旧值"
+    assert "VALUES(" not in conn.last_sql()

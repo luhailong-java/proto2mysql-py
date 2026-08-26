@@ -1,0 +1,32 @@
+# 最小真 TiDB 集群：PD + TiKV + 两个 TiDB 节点。
+#
+# 为什么要两个 TiDB 节点：TiDB 的 DDL 是**异步 online** 的——ALTER 返回时变更
+# 只是进了 DDL 队列，各节点按 lease（默认 45s）分批加载新 schema 版本。
+# 单容器 standalone 只有一个节点，那个窗口根本复现不出来。
+services:
+  pd:
+    image: pingcap/pd:v8.5.1
+    command:
+      - --name=pd0
+      - --client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://pd:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-peer-urls=http://pd:2380
+      - --initial-cluster=pd0=http://pd:2380
+  tikv:
+    image: pingcap/tikv:v8.5.1
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv:20160
+      - --pd=pd:2379
+    depends_on: [pd]
+  tidb0:
+    image: pingcap/tidb:v8.5.1
+    command: ["--store=tikv", "--path=pd:2379", "--advertise-address=tidb0"]
+    ports: ["14001:4000"]
+    depends_on: [tikv]
+  tidb1:
+    image: pingcap/tidb:v8.5.1
+    command: ["--store=tikv", "--path=pd:2379", "--advertise-address=tidb1"]
+    ports: ["14002:4000"]
+    depends_on: [tikv]

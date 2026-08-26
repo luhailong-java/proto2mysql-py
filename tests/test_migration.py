@@ -344,3 +344,50 @@ def test_row_roundtrip_with_scrambled_field_numbers(kitchenpb):
     back = kitchenpb.order_demo()
     pbconv.parse_from_row(back, row)
     assert (back.id, back.a, back.b) == (7, "x", 9)
+
+
+# ── 收窄抑制必须留痕 ─────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("current", "target", "suppressed"),
+    [
+        ("bigint unsigned", "int unsigned NOT NULL DEFAULT 0", True),
+        ("mediumtext", "varchar(255)", True),
+        ("varchar(64)", "varchar(32)", True),
+        ("double", "float NOT NULL DEFAULT 0", True),
+        ("datetime(6)", "DATETIME(3)", True),
+        # 下面这些不是"挡下收窄"，是本来就一样 / 或者需要拓宽
+        ("int unsigned", "int unsigned NOT NULL DEFAULT 0", False),
+        ("int unsigned", "bigint unsigned NOT NULL DEFAULT 0", False),
+        ("mediumtext", "MEDIUMTEXT", False),
+        # 有无符号是值域方向，不是宽窄
+        ("bigint unsigned", "int NOT NULL DEFAULT 0", False),
+    ],
+)
+def test_narrowing_suppressed_detection(current, target, suppressed):
+    """区分"挡下了一次收窄"和"本来就一样"——只有前者该打日志。"""
+    from proto2mysql.table import narrowing_suppressed
+
+    assert narrowing_suppressed(current, target) is suppressed
+
+
+def test_suppressed_narrowing_leaves_a_trace(testpb, caplog):
+    """收窄抑制是本库唯一「什么都不做、也什么都不说」的分支，必须留痕。
+
+    改名有 WARNING、expand_only 违规有带语句清单的报错，唯独这里一声不吭——
+    于是有人在 proto 里把 bigint 改回 int、期待列跟着变窄，结果什么也没发生，
+    也没有任何线索告诉他为什么。
+    """
+    t = table(testpb)
+    current = _aligned_cols(t)
+    current["player_id"] = ColumnMeta("bigint unsigned", 6)  # 与 proto 一致
+    current["port"] = ColumnMeta("bigint unsigned", 3)  # 线上更宽（proto 是 uint32）
+
+    with caplog.at_level("INFO", logger="proto2mysql"):
+        clauses = t.build_alter_clauses(current)
+
+    assert clauses == [], "线上更宽时不该生成任何 ALTER"
+    traces = [r.getMessage() for r in caplog.records if "保持线上的不动" in r.getMessage()]
+    assert traces, "挡下收窄必须留一条日志"
+    assert "port" in traces[0] and "bigint unsigned" in traces[0]

@@ -626,24 +626,6 @@ class DB:
             self.get_table_column_meta(registry_key), expand_only=self.expand_only
         )
 
-        # 补齐缺失的主键。
-        #
-        # build_alter_clauses 只对齐列（ADD/MODIFY/CHANGE COLUMN），从不看主键。
-        # 主键必须与列变更放进**同一条** ALTER：主键列常同时带 AUTO_INCREMENT，
-        # 若先单独 MODIFY 成 AUTO_INCREMENT、再 ADD PRIMARY KEY，MySQL 会在第一条
-        # 就报 Error 1075（auto column must be defined as a key），永远到不了补主键那步。
-        #
-        # 这里只补"从无到有"，绝不自动 DROP/改写已有主键。ADD PRIMARY KEY 在已有重复行时
-        # 会失败；这是预期的 fail-closed 行为，调用方必须先人工去重再重试。
-        missing_pk = False
-        if table.primary_key and not self.table_has_primary_key(table.table_name):
-            missing_pk = True
-            cols = ",".join(escape_mysql_name(pk) for pk in table.primary_key)
-            alter_sqls.append(f"ADD PRIMARY KEY ({cols})")
-            log.warning(
-                "table %s is missing its primary key; adding %s", table.table_name, cols
-            )
-
         # 补齐 proto 里声明了、但线上还没有的索引。
         #
         # 早先索引只出现在 CREATE TABLE 分支：表一旦建成，之后在 .proto 里新加
@@ -651,26 +633,67 @@ class DB:
         # 数据量上来才表现为"莫名其妙变慢"，谁也想不到是建表选项没落地。
         alter_sqls.extend(self._missing_index_clauses(table))
 
-        if not alter_sqls:
-            return
+        # 补齐缺失的主键——**必须与列对齐分成两条 ALTER**。
+        #
+        # 主键列常同时带 AUTO_INCREMENT，而 MySQL 要求「自增列必须是键」：
+        # 单独 MODIFY 成 AUTO_INCREMENT 会报 Error 1075，所以那条 MODIFY 必须与
+        # ADD PRIMARY KEY 同句。早先的做法是把它俩连同全部 ADD COLUMN 塞进**一条**
+        # ALTER，理由是"列对齐与补主键原子成功或失败"。
+        #
+        # 但 2026-08-26 在真 TiDB v8.5.1 上实测发现：**TiDB 根本不支持给已存在的列
+        # 加 AUTO_INCREMENT**（Error 8200 Unsupported modify column: can't set
+        # auto_increment），合并一条、拆成两条都一样。于是那条 ALTER 整体失败，
+        # 连带把所有 ADD COLUMN 一起废掉——服务启动成功，第一条 SELECT 就
+        # Error 1054 Unknown column，而根因埋在一条看起来只是"补主键"的语句里。
+        #
+        # 所以拆开：**列与索引一条、补主键另一条**。补主键失败时列已经对齐好了，
+        # 服务能正常跑，运维再单独处理主键。那点"原子性"换来的代价远大于收益。
+        #
+        # 这里只补"从无到有"，绝不自动 DROP/改写已有主键。
+        pk_clauses: list[str] = []
+        if table.primary_key and not self.table_has_primary_key(table.table_name):
+            cols = ",".join(escape_mysql_name(pk) for pk in table.primary_key)
+            # 把主键列自己的 MODIFY（多半就是那条 AUTO_INCREMENT）挪到这一条里来，
+            # 否则它留在第一条 ALTER 里会因为"自增列还不是键"报 Error 1075。
+            pk_prefixes = tuple(
+                f"MODIFY COLUMN {escape_mysql_name(pk)} " for pk in table.primary_key
+            )
+            moved = [c for c in alter_sqls if c.startswith(pk_prefixes)]
+            alter_sqls = [c for c in alter_sqls if c not in moved]
+            pk_clauses = moved + [f"ADD PRIMARY KEY ({cols})"]
+            log.warning(
+                "table %s is missing its primary key; adding %s", table.table_name, cols
+            )
 
-        alter_sql = (
-            f"ALTER TABLE {escape_mysql_name(table.table_name)} {', '.join(alter_sqls)}"
-        )
-
-        try:
-            self.execute(alter_sql)
-        except Exception as exc:
-            if missing_pk:
+        if alter_sqls:
+            alter_sql = (
+                f"ALTER TABLE {escape_mysql_name(table.table_name)} {', '.join(alter_sqls)}"
+            )
+            try:
+                self.execute(alter_sql)
+            except Exception as exc:
                 raise Proto2MySQLError(
-                    f"更新表 {table.table_name} 结构并补齐主键失败"
-                    f"（可能存在重复行，需先去重再重试）: {exc}, SQL: {alter_sql}"
+                    f"更新表 {table.table_name} 结构失败: {exc}, SQL: {alter_sql}"
                 ) from exc
-            raise Proto2MySQLError(
-                f"更新表 {table.table_name} 结构失败: {exc}, SQL: {alter_sql}"
-            ) from exc
-        self.clear_column_cache(registry_key)
-        self._await_schema_visible(registry_key, table, alter_sqls)
+            self.clear_column_cache(registry_key)
+            self._await_schema_visible(registry_key, table, alter_sqls)
+
+        if pk_clauses:
+            pk_sql = (
+                f"ALTER TABLE {escape_mysql_name(table.table_name)} {', '.join(pk_clauses)}"
+            )
+            try:
+                self.execute(pk_sql)
+            except Exception as exc:
+                raise Proto2MySQLError(
+                    f"表 {table.table_name} 的列已对齐，但补齐主键失败: {exc}\n"
+                    f"  SQL: {pk_sql}\n"
+                    f"  两个常见原因：\n"
+                    f"    1) 线上已有重复行——先人工去重再重试（fail-closed，不会静默跳过）\n"
+                    f"    2) 后端是 TiDB——它**不支持给已存在的列加 AUTO_INCREMENT**\n"
+                    f"       （Error 8200），只能重建表或去掉 auto_increment_key 选项"
+                ) from exc
+            self.clear_column_cache(registry_key)
 
     #: 等 DDL 在所有节点生效的最长秒数与轮询间隔。
     SCHEMA_SETTLE_TIMEOUT = 60.0

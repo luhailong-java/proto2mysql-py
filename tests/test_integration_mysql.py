@@ -51,6 +51,17 @@ def dbname():
     return name
 
 
+def is_tidb(conn) -> bool:
+    """后端是不是 TiDB。
+
+    按 VERSION() 判定而不是靠配置——TiDB 会把自己报成 "8.0.11-TiDB-v8.5.1"，
+    也就是说它**声称自己是 MySQL 8.0**，光看主版本号分不出来。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT VERSION()")
+        return "tidb" in str(cur.fetchone()[0]).lower()
+
+
 @pytest.fixture()
 def conn(dbname):
     c = _connect(dbname)
@@ -358,7 +369,18 @@ def test_add_column_on_existing_table(conn, dbname, testpb):
 
 
 def test_missing_primary_key_is_added(conn, dbname, testpb):
-    """老表没主键时补上——且与列变更在同一条 ALTER 里（分开会撞 Error 1075）。"""
+    """老表没主键时补上。
+
+    补主键与列对齐是**两条**独立的 ALTER：主键列常带 AUTO_INCREMENT，
+    而 MySQL 要求"自增列必须是键"（Error 1075），所以那条 MODIFY 必须与
+    ADD PRIMARY KEY 同句；但它俩绝不能再跟 ADD COLUMN 挤在一条里——
+    2026-08-26 在真 TiDB v8.5.1 上实测过，那样会让列也一起加不上。
+
+    TiDB 上跳过：它**根本不支持给已存在的列加 AUTO_INCREMENT**（Error 8200），
+    合并一条、拆成两条都一样。这不是本库能修的，是 TiDB 的能力边界。
+    """
+    if is_tidb(conn):
+        pytest.skip("TiDB 不支持给已存在的列加 AUTO_INCREMENT（Error 8200）")
     drop(conn, "golang_test")
     with conn.cursor() as cur:
         cur.execute("CREATE TABLE `golang_test` (`id` int unsigned NOT NULL, `ip` MEDIUMTEXT)")

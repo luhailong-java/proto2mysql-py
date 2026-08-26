@@ -24,6 +24,7 @@
 |---|---|
 | 单进程 / 停机更新（同一时刻只有一个版本） | 默认配置就行，什么都不用改 |
 | **滚动 / 金丝雀发布（新旧版本同时在线）** | **必须打开 `expand_only`**，见 [schema-evolution.md](schema-evolution.md) |
+| 多个进程会写同一张表 | 还要读 [concurrency.md](concurrency.md)——**P2MC 不防丢失更新** |
 
 ## 文档索引
 
@@ -32,6 +33,8 @@
 | [schema-evolution.md](schema-evolution.md) | 表结构怎么安全地演进；滚动发布下什么能改、什么不能改 | **上线前必读** |
 | [fixes-2026-08.md](fixes-2026-08.md) | 2026-08 这一轮修了哪些缺陷，每条的现象/根因/改法 | 想知道"以前是什么样、为什么改" |
 | [cache.md](cache.md) | 缓存里存的是什么、为什么条目带一个头部 | 打算开缓存时 |
+| [concurrency.md](concurrency.md) | **P2MC 管什么、不管什么**：丢失更新 / 陈旧缓存 / 脏读幻读的边界 | 多进程写同一张表时 |
+| [testing.md](testing.md) | 怎么跑测试；真库/TiDB 集成测试怎么起；TiDB 的能力边界 | 改代码前后 |
 | [api-safety.md](api-safety.md) | 哪些方法安全、哪些会悄悄毁数据 | 写代码时当速查表 |
 
 ## 名词表（本文档全篇通用）
