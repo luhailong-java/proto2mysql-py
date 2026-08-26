@@ -134,3 +134,38 @@ def test_protoc_failure_surfaces(tmp_path):
     bad.write_text("syntax = \"proto3\"; message {", encoding="utf-8")
     with pytest.raises(RuntimeError, match="protoc failed"):
         proto2sql.generate([str(bad)], [str(OPTION_DIR)])
+
+
+# ── --drop 的警告必须跟着生成物走（P2-2） ────────────────────────────────
+
+
+def test_drop_banner_is_written_into_generated_sql(tmp_path):
+    """光在 CLI 帮助和文档里写警告是不够的。
+
+    真正的风险是**生成出来的 .sql 文件被别人拿去执行**：它看起来就是一份普通的
+    建表脚本，`mysql < schema.sql` 一敲，整库蒸发。所以警告必须跟着文件走。
+    """
+    from proto2mysql.tools.proto2sql import DROP_MODE_BANNER, main
+
+    out = tmp_path / "schema.sql"
+    rc = main([str(PROTO_DIR / "account.proto"), "-I", str(PROTO_DIR), "-I", str(OPTION_DIR),
+               "-o", str(out), "--drop"])
+    assert rc == 0
+
+    body = out.read_text(encoding="utf-8")
+    assert body.startswith(DROP_MODE_BANNER), "危险警告必须在文件最开头"
+    assert "DROP TABLE IF EXISTS" in body
+    assert "切勿" in DROP_MODE_BANNER
+
+
+def test_no_banner_without_drop(tmp_path):
+    """不开 --drop 时不该有这段噪音。"""
+    from proto2mysql.tools.proto2sql import main
+
+    out = tmp_path / "schema.sql"
+    assert main([str(PROTO_DIR / "account.proto"), "-I", str(PROTO_DIR), "-I", str(OPTION_DIR),
+                 "-o", str(out)]) == 0
+
+    body = out.read_text(encoding="utf-8")
+    assert "DROP TABLE" not in body
+    assert "危险" not in body

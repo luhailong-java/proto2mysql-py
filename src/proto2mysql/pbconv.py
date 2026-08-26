@@ -480,14 +480,10 @@ def _parse_container(message: Message, fd: FieldDescriptor, raw: Any) -> None:
     dst.MergeFrom(src)
 
 
-def _set_scalar_default(message: Message, fd: FieldDescriptor) -> None:
-    """空值时把标量字段重置为默认值（bytes/message/enum 保持不变，与 Go 版一致）。
-
-    用 setattr 而不是 ClearField：对 proto3 optional 字段，Go 的 Set(fd, fd.Default())
-    会把字段标记为**已设置**，ClearField 则是未设置——差一个 has 位，
-    再写回数据库时 insert_set_fields 就会少一列。
-    """
-    if fd.type in (
+#: NULL / 空串列在读回时要重置成默认值的标量类型。
+#: 这些都能用 setattr 赋默认值；TYPE_MESSAGE 不行，单独用 ClearField。
+_RESETTABLE_SCALARS = frozenset(
+    {
         _T.TYPE_INT32,
         _T.TYPE_INT64,
         _T.TYPE_UINT32,
@@ -496,8 +492,36 @@ def _set_scalar_default(message: Message, fd: FieldDescriptor) -> None:
         _T.TYPE_DOUBLE,
         _T.TYPE_BOOL,
         _T.TYPE_STRING,
-    ):
+        # ↓ 这三类原先被漏掉，导致跨行串位。见函数注释。
+        _T.TYPE_BYTES,
+        _T.TYPE_ENUM,
+    }
+)
+
+
+def _set_scalar_default(message: Message, fd: FieldDescriptor) -> None:
+    """列值为 NULL / 空时，把字段重置为默认值。
+
+    **必须覆盖所有类型，否则会跨行串位。** 原先这里只处理 8 种标量，
+    刻意跳过 bytes / enum / message（"与 Go 版一致"）。后果是：
+
+        out = golang_test(id=1); db.find_one_by_pk(out)   # payload = b"alice-data"
+        out = golang_test(id=2); db.find_one_by_pk(out)   # 第 2 行 payload 是 NULL
+        # → out.payload 还是 b"alice-data"，**bob 拿到了 alice 的数据**
+
+    而 ``find_one_by_pk(out)`` 的 out 既是入参（主键）又是出参，复用同一个 message
+    正是这个 API 的天然用法，所以这不是"误用"。同样的洞在 Go 侧 scanOneProtoRow 里
+    一模一样，两边一起修。
+
+    用 setattr 而不是 ClearField：对 proto3 optional 字段，Go 的 Set(fd, fd.Default())
+    会把字段标记为**已设置**，ClearField 则是未设置——差一个 has 位，
+    再写回数据库时 insert_set_fields 就会少一列。TYPE_MESSAGE 没有可 setattr 的
+    默认值，只能 ClearField（子消息本来就没有"零值已设置"这一说）。
+    """
+    if fd.type in _RESETTABLE_SCALARS:
         setattr(message, fd.name, fd.default_value)
+    elif fd.type == _T.TYPE_MESSAGE:
+        message.ClearField(fd.name)
 
 
 def _as_text(raw: Any) -> str:

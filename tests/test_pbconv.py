@@ -302,3 +302,44 @@ def test_format_float_shortest_not_just_correct():
     assert pbconv.format_float(0.1, 32) == "0.1"  # 不是 0.10000000149011612
     assert pbconv.format_float(1 / 3, 64) == "0.3333333333333333"
     assert len(pbconv.format_float(0.1, 64)) == len("0.1")
+
+
+# ── NULL 列跨行串位（P0，两版同构） ─────────────────────────────────────
+
+
+def test_null_columns_do_not_leak_across_rows(kitchenpb):
+    """列值为 NULL 时必须把字段重置成默认值，否则复用 message 会串行。
+
+    原先 _set_scalar_default 只处理 8 种标量，**刻意跳过 bytes / enum / message**
+    （注释写着"与 Go 版一致"）。于是：
+
+        out = kitchen_sink(); find_one_by_pk(out)   # alice: payload=b"alice", tier=GOLD
+        out.id = 2;           find_one_by_pk(out)   # bob 这三列都是 NULL
+        # → out.payload / out.tier / out.sub 全是 alice 的值，**bob 拿到了 alice 的数据**
+
+    而 find_one_by_pk(out) 的 out 既是入参（主键）又是出参，复用同一个 message
+    正是这个 API 的天然用法，所以这不是"误用"。Go 侧 scanOneProtoRow 同构。
+    """
+    from proto2mysql import pbconv
+
+    sub = kitchenpb.nested(a=7, b="alice-note")
+    out = kitchenpb.kitchen_sink()
+
+    # 第一行：三类都有值
+    pbconv.parse_from_row(out, (
+        1, "alice", 7, 0, 0, 0.0, 0.0, False,
+        b"alice-payload", 1, None, None, None, 0, sub.SerializeToString(),
+    ))
+    assert out.payload == b"alice-payload"
+    assert out.tier == 1
+    assert out.sub.b == "alice-note"
+
+    # 第二行：payload / tier / sub 三列都是 NULL
+    pbconv.parse_from_row(out, (
+        2, "bob", 0, 0, 0, 0.0, 0.0, False,
+        None, None, None, None, None, 0, None,
+    ))
+    assert out.id == 2 and out.name == "bob"
+    assert out.payload == b"", "bytes 列为 NULL 必须清空，否则串到下一行"
+    assert out.tier == 0, "enum 列为 NULL 必须归零"
+    assert out.sub.b == "", "message 列为 NULL 必须 ClearField"

@@ -20,11 +20,19 @@ from google.protobuf.message import Message
 from . import pbconv
 from .errors import (
     BatchSizeExceededError,
+    InvalidFieldKindError,
+    ExpandOnlyViolationError,
     FieldNotFoundError,
+    FieldNumberReusedError,
     PrimaryKeyNotFoundError,
     Proto2MySQLError,
 )
-from .options import TableOption, apply_options, table_options_from_descriptor
+from .options import (
+    TableOption,
+    apply_options,
+    table_name_from_descriptor,
+    table_options_from_descriptor,
+)
 
 BATCH_INSERT_MAX_SIZE = 1000  # 批量插入最大条数
 
@@ -46,9 +54,12 @@ _T = FieldDescriptor
 # MySQL 字段类型映射表。键是 protobuf 的 FieldDescriptorProto.Type，
 # 与 Go 的 protoreflect.Kind 是同一套编号，所以两边这张表可以逐行对照。
 #
-# 没列出的类型（sint32/sfixed64/fixed32 等）会落到 _DEFAULT_FIELD_TYPE。
-# 这是 Go 版的既有行为，本库保持一致：建表给 TEXT，写入时 pbconv 抛
-# InvalidFieldKindError。也就是说这些类型在 Go 版本来就用不了，别当成 Python 版的缺陷。
+# 没列出的类型（sint32/sint64/fixed32/fixed64/sfixed32/sfixed64）**不支持**，
+# get_mysql_field_type 会在建表时就 fail-fast 抛 InvalidFieldKindError。
+#
+# 早先它们静默回落成 TEXT：建表一路成功，跑到第一次写入才抛异常，而那时列已经
+# 建出来了、可能还上了线。这类 zigzag / 定长编码没有直接对应的 MySQL 列类型，
+# 改用 int32 / int64 / uint32 / uint64 即可（取值范围一样，只是线上编码不同）。
 MYSQL_FIELD_TYPES: dict[int, str] = {
     _T.TYPE_INT32: "int NOT NULL DEFAULT 0",
     _T.TYPE_UINT32: "int unsigned NOT NULL DEFAULT 0",
@@ -62,7 +73,6 @@ MYSQL_FIELD_TYPES: dict[int, str] = {
     _T.TYPE_BYTES: "MEDIUMBLOB",
     _T.TYPE_MESSAGE: "MEDIUMBLOB",
 }
-_DEFAULT_FIELD_TYPE = "TEXT"
 
 # 列注释中记录 proto 字段号的前缀，形如 COMMENT 'pb:3'。
 # 迁移时据此按字段号识别列，从而支持字段改名（CHANGE COLUMN）并保留原有数据。
@@ -177,25 +187,84 @@ _TYPE_ALIASES = {
 }
 
 
+# 同族容量阶梯。判定口径统一为「线上装得下目标就不动它」：
+#   线上容量 >= 目标容量  → 兼容，不生成 ALTER
+#   线上容量 <  目标容量  → 必须 ALTER 拓宽
+#
+# 这条口径原先只有 datetime 分支做对了，另外两族是坏的：
+#
+#   * varchar/char 与 float/double 的方向**是反的**（写的是 target >= current）。
+#     后果双向都错：线上 varchar(50)、proto 要 varchar(100) 时判「兼容」不拓宽，
+#     写 100 字符报 1406；线上 varchar(100)、proto 要 varchar(50) 时反而去 ALTER 收窄。
+#   * 整数族**根本没有方向判断**。int 与 bigint 是不同的 base_type，在下面
+#     `current_base != target_base` 处就直接判不兼容了，于是**两个方向都 ALTER**。
+#
+# 为什么这在滚动发布下是 P0：本库没有 schema 版本概念，每个进程都把自己的 proto
+# 当成唯一正确的目标结构。v2 把 uint32 拓宽成 uint64 之后，任何一个还在跑 v1 的
+# 副本**一重启**就把列 MODIFY 回 int unsigned —— 不需要写任何数据，schema 就在
+# 新旧副本之间来回翻面。文本族同理：2026-08-19 实测撞到过线上 mediumtext 被
+# varchar(255) 的一侧重建，同一条写入在宽列副本成功、窄列副本报 1406，且不可复现。
+#
+# 收窄是有损操作，与本库「永不 DROP COLUMN」的既有立场一致：确实要收窄请手写 ALTER。
+_INT_RANK = {"tinyint": 1, "smallint": 2, "mediumint": 3, "int": 4, "bigint": 5}
+_TEXT_RANK = {"char": 1, "varchar": 2, "tinytext": 3, "text": 4, "mediumtext": 5, "longtext": 6}
+_BLOB_RANK = {"binary": 1, "varbinary": 2, "tinyblob": 3, "blob": 4, "mediumblob": 5, "longblob": 6}
+_FLOAT_RANK = {"float": 1, "double": 2}
+_FAMILIES = (_INT_RANK, _TEXT_RANK, _BLOB_RANK, _FLOAT_RANK)
+
+
+def _base_of(info: "MySQLTypeInfo") -> str:
+    return _TYPE_ALIASES.get(info.base_type) or info.base_type
+
+
+def is_rename_convertible(current_type: str, target_type: str) -> bool:
+    """线上旧列的类型，能不能安全承接改名后的新类型。
+
+    改名保留数据靠的是 ``CHANGE COLUMN``，而 MySQL 会对它做**隐式类型转换**。
+    同基础类型、或同族（int↔bigint、varchar↔mediumtext）都算能接；
+    跨族（mediumtext↔bigint）一律不能——那多半根本不是改名，而是
+    proto 里把一个已删字段的编号让给了类型完全不同的新字段。
+    """
+    current_base = _base_of(parse_mysql_type(current_type))
+    target_base = _base_of(parse_mysql_type(target_type))
+    if current_base == target_base:
+        return True
+    return any(current_base in family and target_base in family for family in _FAMILIES)
+
+
 def is_type_match(current_type: str, target_type: str) -> bool:
-    """判断线上列类型与目标类型是否兼容（不兼容才需要 MODIFY COLUMN）。"""
+    """判断线上列类型与目标类型是否兼容（不兼容才需要 MODIFY COLUMN）。
+
+    口径是**线上装得下目标就算兼容**：线上更宽时一律不动它。理由见 _INT_RANK
+    上方的注释——收窄不但丢数据，在滚动发布期间还会被新旧副本来回改。
+    """
     current = parse_mysql_type(current_type)
     target = parse_mysql_type(target_type)
 
-    current_base = _TYPE_ALIASES.get(current.base_type) or current.base_type
-    target_base = _TYPE_ALIASES.get(target.base_type) or target.base_type
+    current_base = _base_of(current)
+    target_base = _base_of(target)
 
     if current_base != target_base:
+        # 同族跨类型（int↔bigint、varchar↔mediumtext、float↔double）按容量阶梯判方向。
+        # 跨族（比如 int↔mediumtext）没有可比性，一律判不兼容。
+        for family in _FAMILIES:
+            current_rank = family.get(current_base)
+            target_rank = family.get(target_base)
+            if current_rank is None or target_rank is None:
+                continue
+            if family is _INT_RANK and current.unsigned != target.unsigned:
+                # 有无符号决定的是值域方向而不是宽窄，两边都可能装不下对方，必须 ALTER。
+                return False
+            return current_rank >= target_rank
         return False
 
     if current_base in ("varchar", "char"):
-        # 目标长度 >= 当前长度视为兼容
-        return target.length >= current.length
-    if current_base in ("int", "bigint", "tinyint", "smallint"):
-        # 无符号属性必须一致
+        return current.length >= target.length
+    if current_base in _INT_RANK:
+        # 位宽相同，只剩有无符号要比。
         return current.unsigned == target.unsigned
-    if current_base in ("float", "double"):
-        return target.decimal >= current.decimal
+    if current_base in _FLOAT_RANK:
+        return current.decimal >= target.decimal
     if current_base == "datetime":
         # 括号里的是小数秒精度(fsp)。线上精度低于目标时必须 ALTER，
         # 否则老表停留在 DATETIME(0)，写入的毫秒会被静默丢掉——精度修了等于没修。
@@ -277,6 +346,8 @@ class MessageTable:
         "_primary_key_field",
         "_encoders",
         "_cached_columns",
+        "field_numbers",
+        "has_explicit_table_name",
     )
 
     def __init__(
@@ -297,6 +368,11 @@ class MessageTable:
 
         apply_options(self, table_options_from_descriptor(descriptor))
         apply_options(self, opts)
+        #: 是否声明了 table_name 选项。没声明时表名退化成 proto full name（含 package），
+        #: 真正拿它去动数据库时会告警——见 DB._sync_table_schema。
+        self.has_explicit_table_name = table_name_from_descriptor(descriptor)[1] or (
+            self.table_name != descriptor.full_name
+        )
         self._init_sql_fragments()
 
     # ── 构造 ────────────────────────────────────────────────────────────
@@ -333,6 +409,7 @@ class MessageTable:
         self._primary_key_field = (
             self._field_by_name.get(self.primary_key[0]) if self.primary_key else None
         )
+        self.field_numbers = frozenset(fd.number for fd in self._fields)
 
     def new_message(self) -> Message:
         """新建一个该表对应的空消息。"""
@@ -392,7 +469,17 @@ class MessageTable:
         if fd.is_repeated:  # map / list 统一用 MEDIUMBLOB
             return "MEDIUMBLOB"
 
-        base_type = MYSQL_FIELD_TYPES.get(fd.type, _DEFAULT_FIELD_TYPE)
+        base_type = MYSQL_FIELD_TYPES.get(fd.type)
+        if base_type is None:
+            # 早先这里静默回落到 TEXT：建表一路成功，跑到**第一次写入**才抛
+            # InvalidFieldKindError，而那时列已经建出来了、可能还上了线。
+            # 现在在建表/生成 DDL 时就 fail-fast，把问题挡在写库之前。
+            raise InvalidFieldKindError(
+                f"表 {self.table_name} 的字段 {fd.name}（proto type {fd.type}）没有 MySQL 类型映射。\n"
+                f"  sint32 / sint64 / fixed32 / fixed64 / sfixed32 / sfixed64 都不支持——"
+                f"它们的 zigzag / 定长编码没有直接对应的 MySQL 列类型。\n"
+                f"  改用 int32 / int64 / uint32 / uint64 即可（取值范围完全一样，只是线上编码不同）。"
+            )
 
         if self.is_nullable_field(fd.name):
             base_type = base_type.replace(" NOT NULL", "")
@@ -478,7 +565,9 @@ class MessageTable:
             return f"{escaped}({TEXT_INDEX_PREFIX_LENGTH})"
         return escaped
 
-    def build_alter_clauses(self, current_cols: dict[str, ColumnMeta]) -> list[str]:
+    def build_alter_clauses(
+        self, current_cols: dict[str, ColumnMeta], *, expand_only: bool = False
+    ) -> list[str]:
         """按 proto 定义与线上列结构比对，生成 ALTER TABLE 的子句列表。
 
         匹配优先级：
@@ -491,6 +580,16 @@ class MessageTable:
 
         所有生成的列都带 ``COMMENT 'pb:N'``，以便后续迁移继续按字段号识别列。
         不修改传入的 current_cols（内部拷贝一份）。
+
+        :param expand_only: 只允许「纯新增」。产生任何 MODIFY / CHANGE 就抛
+            :class:`ExpandOnlyViolationError`，把语句打印出来交人工审核。
+            **滚动 / 金丝雀发布必须打开**：本库没有 schema 版本概念，每个进程都把
+            自己的 proto 当成唯一正确的目标结构，新旧两版同时在跑时 MODIFY / CHANGE
+            会被两边来回改——不写任何数据，一次重启就翻一次面。ADD COLUMN 没有这个
+            问题（旧版本的 SQL 里根本不会出现新列名），所以放行。
+
+        无论 expand_only 开没开，**字段号被复用**（旧列与新字段类型跨族不可转换）
+        一律抛 :class:`FieldNumberReusedError`——那种情况没有任何正当用途。
         """
         remaining = dict(current_cols)
         by_field_num = {m.field_num: name for name, m in current_cols.items() if m.field_num != 0}
@@ -521,6 +620,28 @@ class MessageTable:
             # 2) 字段号匹配（改名场景）
             old_name = by_field_num.get(fd.number)
             if old_name is not None and old_name in remaining:
+                old_type = remaining[old_name].col_type
+                if not is_rename_convertible(old_type, target_type):
+                    # 类型跨族对不上，这不是改名，是字段号被复用了。
+                    # 照常生成 CHANGE 的话，MySQL 的隐式转换会把旧列内容整列吃掉，
+                    # 而本库「永不 DROP COLUMN」的保护在这里完全帮不上忙。
+                    raise FieldNumberReusedError(
+                        f"表 {self.table_name} 的列 {old_name}（{old_type}，pb:{fd.number}）"
+                        f"与新字段 {field_name}（{target_type}，pb:{fd.number}）类型跨族，"
+                        f"无法当作改名处理。\n"
+                        f"  字段号是 protobuf 的身份，**永不复用**：删字段请用 reserved，"
+                        f"新字段另取一个没用过的编号。\n"
+                        f"  若确实要把这一列的数据转成新类型，请人工写 ALTER 并自行确认转换语义。"
+                    )
+                # 改名能保留数据，但库无法判断谁新谁旧：滚动发布时新旧两版会把这一列
+                # 来回改名（v2 改成新名 → 任何一个 v1 副本重启又改回旧名 → v2 立刻
+                # Error 1054）。所以这里必须留痕。
+                log.warning(
+                    "table %s: column %s -> %s by field number pb:%d. "
+                    "滚动发布期间新旧副本会来回改名，正确做法是 expand→migrate→contract"
+                    "（先加新列、双写回填、下个版本再删旧列）；或对同步调用打开 expand_only。",
+                    self.table_name, old_name, field_name, fd.number,
+                )
                 alter_sqls.append(
                     f"CHANGE COLUMN {escape_mysql_name(old_name)} {escape_mysql_name(field_name)} "
                     f"{target_type}{comment}"
@@ -530,6 +651,16 @@ class MessageTable:
 
             # 3) 全新字段
             alter_sqls.append(f"ADD COLUMN {escape_mysql_name(field_name)} {target_type}{comment}")
+
+        if expand_only:
+            offenders = [c for c in alter_sqls if not c.startswith("ADD COLUMN")]
+            if offenders:
+                raise ExpandOnlyViolationError(
+                    f"表 {self.table_name} 的本次对齐含非「纯新增」变更，expand_only 下拒绝执行：\n  "
+                    + "\n  ".join(offenders)
+                    + "\n  这些语句在滚动发布下会被新旧副本来回执行。请改成"
+                    "expand→migrate→contract 三步，或人工审核后单独执行。"
+                )
 
         return alter_sqls
 
@@ -579,12 +710,54 @@ class MessageTable:
         return Statement(sql, all_args)
 
     def get_batch_replace_sql(self, messages: Sequence[Message]) -> Statement:
+        """⚠️ REPLACE = DELETE+INSERT，**会把本进程不认识的列清回默认值**。见 get_replace_sql。"""
         stmt = self.get_batch_insert_sql(messages)
         return Statement("REPLACE" + stmt.sql[len("INSERT") :], stmt.args)
 
     def get_replace_sql(self, message: Message) -> Statement:
+        """⚠️ ``REPLACE INTO``：**会把本进程不认识的列清回默认值**。
+
+        列清单来自本进程的 descriptor（``self._fields``），而 MySQL 的 REPLACE 语义是
+        「先 DELETE 再 INSERT」——语句里没提到的列不是"保持原值"，是**回到列默认值**。
+        滚动发布时旧版本进程执行一次，新版本刚写进去的列就没了；本库
+        「永不 DROP COLUMN」的保护在这里完全帮不上忙，因为丢的是数据不是列。
+        还会触发外键级联删除。
+
+        :meth:`DB.save` 已经改走 :meth:`get_save_sql`（ON DUPLICATE KEY UPDATE，
+        只覆盖本进程认识的列）。本方法保留为**显式逃生口**：确实需要
+        「整行推倒重来、未提及列一律归位」时才用。
+        """
         args = self.all_field_args(message)
         return Statement(f"{self._replace_sql_prefix}{build_placeholders(len(args))})", args)
+
+    def _values_update_clause(self) -> str:
+        """``col = VALUES(col)`` 列表，覆盖本进程认识的**全部**列。
+
+        与 get_insert_on_dup_update_sql 的区别：那个只覆盖「已赋值」的字段
+        （proto3 零值视为未赋值），所以清零写不进去；save 的语义是「整行落库」，
+        必须把零值也写进去，因此用全字段。
+
+        不管哪一个，ON DUPLICATE KEY UPDATE 都**只动子句里点名的列**，
+        本进程不认识的列原样保留——这正是它比 REPLACE 安全的地方。
+        """
+        return ", ".join(
+            f"{escape_mysql_name(fd.name)} = VALUES({escape_mysql_name(fd.name)})"
+            for fd in self._fields
+        )
+
+    def get_save_sql(self, message: Message) -> Statement:
+        """整行落库：``INSERT ... ON DUPLICATE KEY UPDATE col = VALUES(col), ...``
+
+        取代 REPLACE INTO 作为 :meth:`DB.save` 的实现——同样是「有则更新、无则插入」，
+        但**不会清掉本进程不认识的列**。
+        """
+        stmt = self.get_insert_sql(message)
+        return Statement(f"{stmt.sql} ON DUPLICATE KEY UPDATE {self._values_update_clause()}", stmt.args)
+
+    def get_batch_save_sql(self, messages: Sequence[Message]) -> Statement:
+        """批量整行落库，语义同 :meth:`get_save_sql`。"""
+        stmt = self.get_batch_insert_sql(messages)
+        return Statement(f"{stmt.sql} ON DUPLICATE KEY UPDATE {self._values_update_clause()}", stmt.args)
 
     def get_insert_on_dup_update_sql(self, message: Message) -> Statement:
         """INSERT ... ON DUPLICATE KEY UPDATE，冲突时用**已赋值**的字段覆盖。"""

@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 
 from proto2mysql import ColumnMeta, MessageTable
+from proto2mysql.errors import ExpandOnlyViolationError, FieldNumberReusedError
 from proto2mysql.table import is_type_match, parse_mysql_type
 
 
@@ -43,8 +44,12 @@ def test_parse_mysql_type(text, base, length, decimal, unsigned):
     [
         ("int unsigned", "int unsigned NOT NULL DEFAULT 0", True),
         ("int", "int unsigned NOT NULL DEFAULT 0", False),  # 有无符号必须一致
-        ("varchar(32)", "varchar(64)", True),  # 放大兼容
-        ("varchar(64)", "varchar(32)", False),  # 缩小不兼容
+        # 统一口径：线上装得下目标就不动它。下面四条原先方向是反的
+        # （线上窄却判兼容不拓宽、线上宽反而去 ALTER 收窄），见 table.py 的 _INT_RANK 注释。
+        ("varchar(32)", "varchar(64)", False),  # 线上更窄，必须拓宽
+        ("varchar(64)", "varchar(32)", True),  # 线上更宽，不动它（收窄会截断已有数据）
+        ("float", "double", False),  # 线上更窄，必须拓宽
+        ("double", "float", True),  # 线上更宽，不动它
         ("mediumtext", "MEDIUMTEXT", True),  # 大小写无关
         ("timestamp", "datetime(6)", False),  # 精度不足必须 ALTER
         ("datetime", "DATETIME(6)", False),  # DATETIME(0) 必须升到 (6)
@@ -54,6 +59,40 @@ def test_parse_mysql_type(text, base, length, decimal, unsigned):
     ],
 )
 def test_is_type_match(current, target, match):
+    assert is_type_match(current, target) is match
+
+
+@pytest.mark.parametrize(
+    ("current", "target", "match"),
+    [
+        # ── 整数族：int 与 bigint 是不同的 base_type，修复前两个方向都会 ALTER ──
+        ("bigint unsigned", "int unsigned NOT NULL DEFAULT 0", True),  # 线上更宽，不收窄
+        ("int unsigned", "bigint unsigned NOT NULL DEFAULT 0", False),  # 线上更窄，要拓宽
+        ("bigint", "tinyint NOT NULL DEFAULT 0", True),
+        ("tinyint", "bigint NOT NULL DEFAULT 0", False),
+        # 有无符号决定值域方向，不是宽窄问题，两边都装不下对方 → 一律 ALTER
+        ("bigint unsigned", "int NOT NULL DEFAULT 0", False),
+        ("bigint", "int unsigned NOT NULL DEFAULT 0", False),
+        # ── 文本族：2026-08-19 实测事故——线上 mediumtext 被 varchar(255) 一侧重建，
+        #    同一条写入在宽列副本成功、窄列副本报 1406，且不可复现 ──
+        ("mediumtext", "varchar(255)", True),  # 线上更宽，不收窄
+        ("varchar(255)", "MEDIUMTEXT", False),  # 线上更窄，要拓宽
+        ("longtext", "MEDIUMTEXT", True),
+        ("text", "MEDIUMTEXT", False),
+        # ── 二进制族 ──
+        ("mediumblob", "varbinary(255)", True),
+        ("varbinary(255)", "MEDIUMBLOB", False),
+        # ── 跨族没有可比性，一律判不兼容 ──
+        ("int", "MEDIUMTEXT", False),
+        ("mediumtext", "bigint NOT NULL DEFAULT 0", False),
+    ],
+)
+def test_is_type_match_never_narrows(current, target, match):
+    """跨类型的同族变更只许拓宽，绝不许收窄。
+
+    修复前：整数族没有方向判断（int/bigint 是不同 base_type，直接判不兼容），
+    文本族同理，于是滚动发布时 v1 副本一重启就把 v2 拓宽过的列 MODIFY 回去。
+    """
     assert is_type_match(current, target) is match
 
 
@@ -139,6 +178,79 @@ def test_alter_does_not_mutate_input(testpb):
     snapshot = dict(current)
     t.build_alter_clauses(current)
     assert current == snapshot
+
+
+# ── 改名 / 字段号复用 / expand_only ──────────────────────────────────────
+
+
+def _aligned_cols(t) -> dict[str, ColumnMeta]:
+    return {fd.name: ColumnMeta(t.get_mysql_field_type(fd), fd.number) for fd in t.fields}
+
+
+def test_rename_still_supported_by_default(testpb, caplog):
+    """改名保留数据是本库的招牌特性，默认行为不变——只是多打一条告警。"""
+    t = table(testpb)
+    current = _aligned_cols(t)
+    current["old_ip"] = current.pop("ip")  # 线上还叫 old_ip，proto 已改名为 ip
+
+    with caplog.at_level("WARNING", logger="proto2mysql"):
+        clauses = t.build_alter_clauses(current)
+
+    assert clauses == ["CHANGE COLUMN `old_ip` `ip` MEDIUMTEXT COMMENT 'pb:2'"]
+    # 库无法判断谁新谁旧，滚动发布时新旧副本会来回改名，必须留痕。
+    assert any("pb:2" in r.getMessage() for r in caplog.records)
+
+
+def test_field_number_reuse_is_refused(testpb):
+    """字段号被复用（跨族类型）一律拒绝，不设开关——这没有任何正当用途。
+
+    修复前会静默生成 CHANGE COLUMN，MySQL 的隐式类型转换把旧列内容整列吃掉，
+    而本库「永不 DROP COLUMN」的保护在这里完全帮不上忙。
+    """
+    t = table(testpb)
+    current = _aligned_cols(t)
+    # 线上 pb:6 是一列文本（旧字段留下的），proto 里 pb:6 已经是 bigint 了
+    current.pop("player_id")
+    current["legacy_note"] = ColumnMeta("mediumtext", 6)
+
+    with pytest.raises(FieldNumberReusedError) as exc:
+        t.build_alter_clauses(current)
+    assert "legacy_note" in str(exc.value)
+    assert "reserved" in str(exc.value)
+
+
+def test_expand_only_allows_pure_additions(testpb):
+    """纯新增在 expand_only 下照常放行——旧版本的 SQL 里根本不会出现新列名。"""
+    t = table(testpb)
+    current = _aligned_cols(t)
+    del current["player_id"]
+
+    clauses = t.build_alter_clauses(current, expand_only=True)
+    assert clauses == [
+        "ADD COLUMN `player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:6'"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "offender"),
+    [
+        # 类型不兼容 → MODIFY
+        (lambda c: c.__setitem__("ip", ColumnMeta("int", 2)), "MODIFY COLUMN"),
+        # 改名 → CHANGE
+        (lambda c: c.__setitem__("old_ip", c.pop("ip")), "CHANGE COLUMN"),
+    ],
+)
+def test_expand_only_refuses_modify_and_change(testpb, mutate, offender):
+    """expand_only 拦下 MODIFY / CHANGE —— 滚动发布时它们会被新旧副本来回执行。"""
+    t = table(testpb)
+    current = _aligned_cols(t)
+    mutate(current)
+
+    with pytest.raises(ExpandOnlyViolationError) as exc:
+        t.build_alter_clauses(current, expand_only=True)
+    assert offender in str(exc.value)
+    # 关掉开关就是既有行为，照常生成。
+    assert any(c.startswith(offender) for c in t.build_alter_clauses(current))
 
 
 # ── 建表 DDL 的字段类型 ─────────────────────────────────────────────────

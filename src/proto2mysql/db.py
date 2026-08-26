@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import contextmanager
 from types import ModuleType
 from typing import Any, Iterable, Iterator, Sequence
@@ -31,7 +32,7 @@ from google.protobuf.descriptor import Descriptor, FieldDescriptor
 from google.protobuf.message import Message
 
 from . import pbconv
-from .cache import Cache
+from .cache import Cache, decode_entry, encode_entry
 from .errors import (
     CacheMissError,
     DuplicateKeyError,
@@ -85,6 +86,7 @@ class DB:
         tables: dict[str, MessageTable] | None = None,
         cache: Cache | None = None,
         cache_ttl: float | None = None,
+        expand_only: bool = False,
         _in_transaction: bool = False,
     ) -> None:
         self.connection = connection
@@ -95,6 +97,9 @@ class DB:
         self.tables: dict[str, MessageTable] = tables if tables is not None else {}
         self._cache = cache
         self._cache_ttl = cache_ttl
+        #: 只允许「纯新增」的结构变更。默认关（保持既有行为，改名照常保留数据）。
+        #: **滚动 / 金丝雀发布必须打开**，理由见 MessageTable.build_alter_clauses。
+        self.expand_only = expand_only
         self._in_transaction = _in_transaction
         self._pending_cache_dels: list[str] = []
         self._table_exists_cache: dict[str, bool] = {}
@@ -120,6 +125,7 @@ class DB:
             tables=self.tables,
             cache=self._cache,
             cache_ttl=self._cache_ttl,
+            expand_only=self.expand_only,
         )
 
     def close(self) -> None:
@@ -197,6 +203,7 @@ class DB:
             tables=self.tables,
             cache=self._cache,
             cache_ttl=self._cache_ttl,
+            expand_only=self.expand_only,
             _in_transaction=True,
         )
         # 只在 autocommit=True 时才显式 begin()。
@@ -243,7 +250,19 @@ class DB:
         return self._cache is not None
 
     def cache_key(self, message: Message) -> str:
-        """message 对应的缓存 key：``pb:<表名>:<主键值...>``"""
+        """message 对应的缓存 key：``pb:<表名>:<主键值...>``
+
+        ⚠️ **schema 版本刻意不进 key，而是进 value 的头部**（见 cache.encode_entry）。
+
+        看起来把指纹拼进 key 更省事——新旧版本天然不共享条目、投毒路径直接消失。
+        但失效路径与读路径共用本函数：v1 写库后去删的是**自己那个指纹**的 key，
+        v2 缓存的那条永远没人删，于是「读到残缺数据」被升级成
+        「跨版本永久脏读」，一直脏到 TTL 到期。比原来的问题更糟。
+
+        放进 value 头部则：key 不变 → 失效跨版本照常生效；读时做超集判定 →
+        只有「认识更多字段的一方读到认识更少的一方写的条目」才 miss（单向），
+        雪崩面小，而且是原地覆写，不会把旧 key 空间搁浅占内存。
+        """
         return self._cache_key_for(self._table_for_message(message), message)
 
     @staticmethod
@@ -272,12 +291,35 @@ class DB:
         except Exception as exc:  # noqa: BLE001 - 缓存是弱依赖，出错只降级
             log.warning("cache get %s failed (fallback to db): %s", key, exc)
             return False
+
+        entry = decode_entry(data)
+        if entry is None:
+            # 没有信封：要么是老版本写的裸 pb 字节，要么根本不是本库写的。
+            # 一律当未命中回源——下一次写会把它原地覆盖成带信封的条目。
+            log.warning("cache entry %s has no envelope (fallback to db)", key)
+            return False
+        writer_fields, payload = entry
+        if not writer_fields >= table.field_numbers:
+            # 写入方认识的字段比我少，这条记录对我来说是**残缺**的。
+            # 直接用会让我新增的那些字段静默拿到零值，而库里其实是有值的。
+            log.warning(
+                "cache entry %s was written by an older schema "
+                "(missing pb:%s); falling back to db",
+                key, sorted(table.field_numbers - writer_fields),
+            )
+            return False
+
+        # 解析到临时对象再拷回去：原先是先 Clear() 再 ParseFromString()，
+        # 解析一旦失败，调用方 message 的**主键已经被清成 0**，
+        # 上层拿着 0 回去查库，于是查错行/查不到，且看不出根因。
+        scratch = table.new_message()
         try:
-            message.Clear()
-            message.ParseFromString(data)
+            scratch.ParseFromString(payload)
         except Exception as exc:  # noqa: BLE001
             log.warning("cache unmarshal %s failed (fallback to db): %s", key, exc)
             return False
+        message.Clear()
+        message.MergeFrom(scratch)
         return True
 
     def _cache_set_proto(self, table: MessageTable, message: Message) -> None:
@@ -286,7 +328,8 @@ class DB:
         except Proto2MySQLError:
             return
         try:
-            self._cache.set(key, message.SerializeToString(), self._cache_ttl)
+            payload = encode_entry(table.field_numbers, message.SerializeToString())
+            self._cache.set(key, payload, self._cache_ttl)
         except Exception as exc:  # noqa: BLE001
             log.warning("cache set %s failed: %s", key, exc)
 
@@ -443,18 +486,145 @@ class DB:
         """同步表字段（表不存在则创建，存在则对齐字段类型）。"""
         self.create_or_update_table(m)
 
+    #: 抢 DDL 咨询锁的等待秒数。
+    SYNC_LOCK_TIMEOUT = 30
+    #: 咨询锁的名字（同一个库内全局）。
+    SYNC_LOCK_NAME = "proto2mysql:sync"
+
     def sync_all_tables(self) -> None:
-        """对全部已注册表执行建表 / 字段对齐。常与 register_all_tables 搭配。"""
-        for key, table in self.tables.items():
-            self._sync_table_schema(key, table)
+        """对全部已注册表执行建表 / 字段对齐。常与 register_all_tables 搭配。
+
+        全程持有一把 MySQL 咨询锁（``GET_LOCK``），同一时刻只有一个进程在改结构。
+
+        没有这把锁时：N 个副本同时冷启动 → 一个 ALTER 成功、其余全部撞
+        ``Error 1060 Duplicate column name`` → 抛异常 → 启动失败。下一次重启会成功
+        （列已经存在，对齐结果为空），所以它是**"自愈式蒙对"**——日志里留下一串启动失败、
+        服务最终起来了，很容易被当成偶发 flake 忽略，直到某次重启风暴把它放大。
+
+        锁拿不到时**不阻断**：MySQL 的 GET_LOCK 在超时时返回 0、连接异常时返回 NULL，
+        而 TiDB 等兼容实现不一定支持这个函数。所以拿不到锁只降级为"无锁执行 + 一条告警"，
+        再靠下面的 1060/1061/1050 容错兜底——把可用性问题看得比"锁一定要拿到"更重。
+        """
+        acquired = self._acquire_sync_lock()
+        try:
+            for key, table in self.tables.items():
+                self._sync_table_schema(key, table)
+        finally:
+            if acquired:
+                self._release_sync_lock()
+
+    def _existing_index_names(self, table_name: str) -> set[str]:
+        """线上这张表已有的索引名（不含 PRIMARY）。"""
+        rows = self.query(
+            "SELECT DISTINCT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS "
+            "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+            [self.dbname, table_name],
+        )
+        return {r[0] for r in rows if r and r[0] and r[0] != "PRIMARY"}
+
+    def _missing_index_clauses(self, table: MessageTable) -> list[str]:
+        """proto 里声明了、线上却没有的索引，生成 ADD INDEX / ADD UNIQUE KEY。
+
+        **只加不删**：线上多出来的索引一律不动（可能是 DBA 按查询模式手工加的，
+        库没有立场去删）。与「永不 DROP COLUMN」是同一个立场。
+
+        索引名与 CREATE TABLE 分支保持一致（``idx_<表名>_<序号>`` / ``uk_<表名>``），
+        否则同一份 proto 在"新建表"和"老表补索引"两条路径上会产出不同的索引名。
+        """
+        if not table.indexes and not table.unique_keys:
+            return []  # proto 里一个索引都没声明，不必去查 information_schema
+
+        try:
+            existing = self._existing_index_names(table.table_name)
+        except Exception as exc:  # noqa: BLE001 - 查不到就跳过，不阻断结构同步
+            log.warning("读取表 %s 的既有索引失败，本次跳过索引补齐：%s", table.table_name, exc)
+            return []
+
+        clauses: list[str] = []
+        for idx, index_cols in enumerate(table.indexes):
+            name = f"idx_{table.table_name}_{idx}"
+            if name in existing:
+                continue
+            cols = ",".join(table._index_column(c.strip()) for c in index_cols.split(","))
+            clauses.append(f"ADD INDEX {escape_mysql_name(name)} ({cols})")
+            log.info("table %s 补索引 %s (%s)", table.table_name, name, cols)
+
+        if table.unique_keys:
+            name = f"uk_{table.table_name}"
+            if name not in existing:
+                cols = ",".join(
+                    table._index_column(c.strip()) for c in table.unique_keys.split(",")
+                )
+                clauses.append(f"ADD UNIQUE KEY {escape_mysql_name(name)} ({cols})")
+                log.warning(
+                    "table %s 补唯一键 %s (%s)：线上若已有重复行，这条 ALTER 会失败，"
+                    "需先人工去重再重试（fail-closed，不会静默跳过）",
+                    table.table_name, name, cols,
+                )
+        return clauses
+
+    def _acquire_sync_lock(self) -> bool:
+        """抢 DDL 咨询锁。拿到返回 True；超时 / 不支持 / 出错都返回 False 并降级。"""
+        try:
+            got = self.query_one_value(
+                "SELECT GET_LOCK(?, ?)", [self.SYNC_LOCK_NAME, self.SYNC_LOCK_TIMEOUT]
+            )
+        except Exception as exc:  # noqa: BLE001 - 不支持 GET_LOCK 的实现会直接报错
+            log.warning(
+                "拿不到 DDL 咨询锁（%s），本次结构同步无锁执行：%s。"
+                "多副本同时启动时可能撞 Error 1060，重启即可自愈",
+                self.SYNC_LOCK_NAME, exc,
+            )
+            return False
+        if got is None or int(got) != 1:
+            # 返回 0 = 等超时了（别人正在改）；NULL = 连接出错。两种都只告警不阻断。
+            log.warning(
+                "DDL 咨询锁 %s 未取得（返回 %r），本次结构同步无锁执行", self.SYNC_LOCK_NAME, got
+            )
+            return False
+        return True
+
+    def _release_sync_lock(self) -> None:
+        try:
+            self.query_one_value("SELECT RELEASE_LOCK(?)", [self.SYNC_LOCK_NAME])
+        except Exception as exc:  # noqa: BLE001
+            # 连接断开时锁会被服务端自动释放，这里失败不影响正确性。
+            log.warning("释放 DDL 咨询锁 %s 失败（连接断开时会自动释放）：%s", self.SYNC_LOCK_NAME, exc)
 
     def _sync_table_schema(self, registry_key: str, table: MessageTable) -> None:
+        if not table.has_explicit_table_name:
+            # 表名退化成了 proto full name（含 package）。这在 package 一改就出事：
+            # v2 把 package 从 game.v1 改成 game.v2，表名跟着变 → 建出一张**全新的空表**，
+            # v1 的数据留在旧表里，而**两边都不报错**——服务照常起来，玩家数据"凭空消失"。
+            #
+            # 只在真正要拿这个表名去动数据库时才告警：构造期就喊会把 golang_test_list
+            # 这类"列表包装消息"（压根不是表）也一起喊上，变成噪音。
+            log.warning(
+                "表 %s 没有声明 table_name 选项，表名退化为 proto full name。"
+                "proto 的 package 一改表名就跟着变，会建出一张空表而旧数据留在旧表里，"
+                "且两边都不报错。建议在 .proto 里显式写 option (proto2mysql.table_name)",
+                table.table_name,
+            )
         if not self.is_table_exists(table.table_name):
             self.execute(table.get_create_table_sql())
             self._table_exists_cache[table.table_name] = True
-            return
+            # 刻意**不 return**，继续往下走列对齐。
+            #
+            # 建表语句是 CREATE TABLE IF NOT EXISTS，在并发下可能整条是 no-op：
+            # 两个版本的进程同时冷启动到空库时，先到的那个按自己的 proto 建表，
+            # 后到的这条 CREATE 只会拿到一条 Warning 1050——不报错、不改结构。
+            # 早先这里直接 return，于是后到进程独有的新列**从未被添加**，而它自己
+            # 启动成功、零异常，一直到第一条 SELECT 才报 Error 1054 Unknown column；
+            # 且 _table_exists_cache 已置 True，重启也不会重新对齐，**不自愈**。
+            #
+            # 落到对齐路径上就没有这个问题：get_table_column_meta 直读
+            # INFORMATION_SCHEMA（不走缓存），拿到的是真实建成的结构，
+            # 缺什么补什么。自己建成功的那条路径上 build_alter_clauses 返回空，
+            # 只多一次元信息查询，代价可以忽略。
 
-        alter_sqls = table.build_alter_clauses(self.get_table_column_meta(registry_key))
+        alter_sqls = table.build_alter_clauses(
+            self.get_table_column_meta(registry_key), expand_only=self.expand_only
+        )
 
         # 补齐缺失的主键。
         #
@@ -474,12 +644,20 @@ class DB:
                 "table %s is missing its primary key; adding %s", table.table_name, cols
             )
 
+        # 补齐 proto 里声明了、但线上还没有的索引。
+        #
+        # 早先索引只出现在 CREATE TABLE 分支：表一旦建成，之后在 .proto 里新加
+        # index / unique_key **完全不生效**，而且零提示——查询照常能跑，只是走全表扫描，
+        # 数据量上来才表现为"莫名其妙变慢"，谁也想不到是建表选项没落地。
+        alter_sqls.extend(self._missing_index_clauses(table))
+
         if not alter_sqls:
             return
 
         alter_sql = (
             f"ALTER TABLE {escape_mysql_name(table.table_name)} {', '.join(alter_sqls)}"
         )
+
         try:
             self.execute(alter_sql)
         except Exception as exc:
@@ -492,6 +670,75 @@ class DB:
                 f"更新表 {table.table_name} 结构失败: {exc}, SQL: {alter_sql}"
             ) from exc
         self.clear_column_cache(registry_key)
+        self._await_schema_visible(registry_key, table, alter_sqls)
+
+    #: 等 DDL 在所有节点生效的最长秒数与轮询间隔。
+    SCHEMA_SETTLE_TIMEOUT = 60.0
+    SCHEMA_SETTLE_INTERVAL = 0.2
+
+    @staticmethod
+    def _added_column_names(alter_sqls: Sequence[str]) -> set[str]:
+        """从 ALTER 子句里挑出本次**新增**的列名。
+
+        只等这些列：MODIFY / CHANGE 改的是已有列，回读时本来就看得见，
+        等它们既没意义又会把探测拖长。
+        """
+        names: set[str] = set()
+        for clause in alter_sqls:
+            if not clause.startswith("ADD COLUMN `"):
+                continue
+            rest = clause[len("ADD COLUMN `") :]
+            end = rest.find("`")
+            if end > 0:
+                names.add(rest[:end].replace("``", "`"))
+        return names
+
+    def _await_schema_visible(
+        self, registry_key: str, table: MessageTable, alter_sqls: Sequence[str]
+    ) -> None:
+        """等到 ALTER 的结果**真的能被看见**，再放行后续 SQL。
+
+        MySQL 单机上这一步立刻就过（DDL 返回即生效），几乎零开销。
+
+        但 **TiDB 的 DDL 是异步 online 的**：ALTER 语句返回时，schema 变更只是进了
+        DDL 队列，各个 TiDB 节点要按 lease（默认 45s）分批加载新的 schema 版本。
+        库执行完 ALTER 立刻按新 proto 发 INSERT/SELECT，这段窗口里连到**还没加载
+        新 schema 的节点**就会报 Unknown column——启动日志漂亮，第一批请求全挂。
+        原先这里没有任何等待或重试。
+
+        实现上刻意**不去检测"后端是不是 TiDB"**：版本号/变量嗅探很容易被兼容层骗过，
+        而"回读 information_schema 直到结构真的对上"是纯行为判定，对 MySQL、TiDB、
+        以及任何自称兼容的实现都成立。
+        """
+        want = self._added_column_names(alter_sqls)
+        if not want:
+            return  # 本次没有新增列（只有 MODIFY / CHANGE / 索引），无需等待
+
+        deadline = time.monotonic() + self.SCHEMA_SETTLE_TIMEOUT
+        while True:
+            try:
+                live = set(self.get_table_column_meta(registry_key))
+            except Exception as exc:  # noqa: BLE001 - 探测失败不该反过来阻断启动
+                log.warning("回读表 %s 结构失败，跳过就绪探测：%s", table.table_name, exc)
+                return
+            if not live:
+                # 一列都读不到 = 根本看不见这张表（权限/库名不对/驱动不给结果）。
+                # 真表不可能零列，所以这不是"还没生效"，继续轮询只会白等到超时。
+                log.debug("表 %s 回读不到任何列，跳过就绪探测", table.table_name)
+                return
+            missing = want - live
+            if not missing:
+                return
+            if time.monotonic() >= deadline:
+                # 只告警不抛：结构可能确实还在后台排队。抛异常会把"慢"升级成"起不来"。
+                log.warning(
+                    "表 %s 的结构变更在 %.0fs 内没有全部可见（仍缺 %s）。"
+                    "TiDB 的 DDL 是异步的，可能仍在后台排队；"
+                    "若后续 SQL 报 Unknown column，等一个 schema lease 再重试",
+                    table.table_name, self.SCHEMA_SETTLE_TIMEOUT, sorted(missing),
+                )
+                return
+            time.sleep(self.SCHEMA_SETTLE_INTERVAL)
 
     def get_create_table_sql(self, m: Message | type[Message]) -> str:
         return self._table_for_message(m).get_create_table_sql()
@@ -511,7 +758,7 @@ class DB:
             return table.get_create_table_sql()
 
         alter_sqls = table.build_alter_clauses(
-            self.get_table_column_meta(table.descriptor.full_name)
+            self.get_table_column_meta(table.descriptor.full_name), expand_only=self.expand_only
         )
         if not alter_sqls:
             return ""
@@ -576,20 +823,29 @@ class DB:
         self._invalidate_messages(table, message)
 
     def save(self, message: Message) -> None:
-        """整行替换（REPLACE INTO）。"""
+        """整行落库：有则更新、无则插入。
+
+        走 ``INSERT ... ON DUPLICATE KEY UPDATE``，**不是** ``REPLACE INTO``。
+        REPLACE 的语义是「先 DELETE 再 INSERT」，语句里没提到的列会**回到默认值**——
+        而列清单来自本进程的 descriptor，所以滚动发布时旧版本进程 save 一次，
+        新版本刚写进去的列就没了，且零报错。ODKU 只动子句里点名的列，
+        本进程不认识的列原样保留。
+
+        需要「整行推倒重来」的旧语义时，显式用 ``SQLBuilder.replace``。
+        """
         table = self._table_for_message(message)
-        self._exec_stmt(table.get_replace_sql(message))
+        self._exec_stmt(table.get_save_sql(message))
         self._invalidate_messages(table, message)
 
     def batch_save(self, messages: Sequence[Message]) -> None:
-        """批量整行替换（自动分批）。"""
+        """批量整行落库（自动分批），语义同 :meth:`save`。"""
         if not messages:
             return
         table = self._table_for_message(messages[0])
         for msg in messages:
             table.validate_message(msg)
         for batch in _chunks(messages, BATCH_INSERT_MAX_SIZE):
-            self._exec_stmt(table.get_batch_replace_sql(batch))
+            self._exec_stmt(table.get_batch_save_sql(batch))
         self._invalidate_messages(table, *messages)
 
     # ── UPDATE ──────────────────────────────────────────────────────────

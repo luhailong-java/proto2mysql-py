@@ -10,6 +10,7 @@ import pytest
 from fakedb import FakeConnection, FakeIntegrityError
 
 from proto2mysql import DB, DictCache
+from proto2mysql.cache import decode_entry, encode_entry
 from proto2mysql.errors import (
     DuplicateKeyError,
     MultipleRowsFoundError,
@@ -255,7 +256,7 @@ def test_cache_invalidation_deferred_until_commit(db, conn, testpb):
     """事务内先不删缓存——回滚后删了就是把还有效的缓存误删。"""
     cache = DictCache()
     db.enable_cache(cache)
-    cache.set("pb:golang_test:9", b"x", None)
+    cache.set(db.cache_key(testpb.golang_test(id=9)), b"x", None)
 
     with pytest.raises(RuntimeError):
         with db.transaction() as tx:
@@ -293,10 +294,173 @@ def test_cache_failure_degrades_to_db(db, conn, testpb):
 # ── 建表 / 迁移 ─────────────────────────────────────────────────────────
 
 
+def test_save_preserves_unknown_columns(db, conn, testpb):
+    """save 必须走 ODKU，不能走 REPLACE INTO。
+
+    REPLACE 是 DELETE+INSERT，语句里没提到的列会**回到默认值**；而列清单来自本进程的
+    descriptor，所以滚动发布时旧版本 save 一次，新版本刚写进去的列就没了，且零报错。
+    ODKU 只动子句里点名的列，别的原样保留。
+    """
+    db.save(testpb.golang_test(id=7, ip="a"))
+    sql = conn.last_sql()
+    assert sql.startswith("INSERT INTO `golang_test`")
+    assert "ON DUPLICATE KEY UPDATE" in sql
+    assert "REPLACE" not in sql
+    # 零值也要写进去——save 的语义是「整行落库」，不是「只写非零字段」
+    assert "`port` = VALUES(`port`)" in sql
+
+
+def test_batch_save_preserves_unknown_columns(db, conn, testpb):
+    db.batch_save([testpb.golang_test(id=1), testpb.golang_test(id=2)])
+    sql = conn.last_sql()
+    assert sql.startswith("INSERT INTO `golang_test`")
+    assert "ON DUPLICATE KEY UPDATE" in sql
+    assert "REPLACE" not in sql
+
+
+def test_replace_remains_available_as_escape_hatch(db, testpb):
+    """整行推倒重来的旧语义保留为显式逃生口，只是不再是 save 的默认。"""
+    table = db.tables[testpb.golang_test.DESCRIPTOR.full_name]
+    assert table.get_replace_sql(testpb.golang_test(id=7)).sql.startswith("REPLACE INTO `golang_test`")
+
+
+def test_cache_key_has_no_schema_version(db, testpb):
+    """schema 版本刻意**不进 key**。
+
+    把指纹拼进 key 看起来更省事，但失效路径与读路径共用 key 生成器：
+    v1 写库后删的是自己那个指纹的 key，v2 缓存的那条永远没人删，
+    于是「读到残缺数据」被升级成「跨版本永久脏读」。版本信息放在 value 头部。
+    """
+    assert db.cache_key(testpb.golang_test(id=9)) == "pb:golang_test:9"
+
+
+def test_cache_entry_from_older_schema_is_a_miss(db, conn, testpb):
+    """写入方认识的字段比我少 → 当未命中回源，而不是把新字段静默读成零值。"""
+    cache = DictCache()
+    db.enable_cache(cache)
+    table = db.tables[testpb.golang_test.DESCRIPTOR.full_name]
+
+    # 模拟旧版本进程写的条目：它不认识 player_id(pb:6)
+    old_fields = table.field_numbers - {6}
+    stale = testpb.golang_test(id=9, ip="from-old-writer")
+    cache.set(db.cache_key(stale), encode_entry(old_fields, stale.SerializeToString()), None)
+
+    conn.queue_rows([(9, "from-db", 0, 0, b"", 77)])
+    out = testpb.golang_test(id=9)
+    db.find_one_by_pk(out)
+    assert out.ip == "from-db", "残缺条目必须回源，不能直接采用"
+    assert out.player_id == 77
+
+
+def test_cache_entry_from_newer_schema_is_usable(db, conn, testpb):
+    """写入方认识得更多 → 可以直接用（多出来的字段对我就是 unknown fields）。
+
+    所以 miss 是**单向**的，滚动发布期间的雪崩面比"把指纹拼进 key"小得多。
+    """
+    cache = DictCache()
+    db.enable_cache(cache)
+    table = db.tables[testpb.golang_test.DESCRIPTOR.full_name]
+
+    fresh = testpb.golang_test(id=9, ip="from-newer-writer")
+    newer_fields = table.field_numbers | {999}
+    cache.set(db.cache_key(fresh), encode_entry(newer_fields, fresh.SerializeToString()), None)
+
+    # 没给 conn 排任何结果集：一旦回源就会抛 NoRowsFoundError，所以能读到值即证明命中缓存。
+    out = testpb.golang_test(id=9)
+    db.find_one_by_pk(out)
+    assert out.ip == "from-newer-writer"
+
+
+def test_corrupt_cache_entry_does_not_clobber_primary_key(db, conn, testpb):
+    """解析失败不能把调用方 message 的主键清成 0。
+
+    原先是先 Clear() 再 ParseFromString()：解析一失败，主键已经没了，
+    上层拿着 id=0 回去查库，于是查错行/查不到，且完全看不出根因。
+    """
+    cache = DictCache()
+    db.enable_cache(cache)
+    table = db.tables[testpb.golang_test.DESCRIPTOR.full_name]
+    cache.set(db.cache_key(testpb.golang_test(id=9)), encode_entry(table.field_numbers, b"\xff\xff\xff"), None)
+
+    conn.queue_rows([(9, "from-db", 0, 0, b"", 0)])
+    out = testpb.golang_test(id=9)
+    db.find_one_by_pk(out)
+    assert out.id == 9, "解析失败后主键必须还在"
+    assert out.ip == "from-db"
+
+
+def test_legacy_bare_proto_entry_is_a_miss(db, conn, testpb):
+    """老版本写的裸 pb 字节（无信封）当未命中——安全，且会被下次写覆盖。"""
+    cache = DictCache()
+    db.enable_cache(cache)
+    stale = testpb.golang_test(id=9, ip="bare-bytes")
+    cache.set(db.cache_key(stale), stale.SerializeToString(), None)
+
+    conn.queue_rows([(9, "from-db", 0, 0, b"", 0)])
+    out = testpb.golang_test(id=9)
+    db.find_one_by_pk(out)
+    assert out.ip == "from-db"
+
+
+def test_cache_entry_roundtrip():
+    """信封编解码；两语言必须逐字节一致（可能共用同一个 Redis）。"""
+    payload = b"\x08\x2a"
+    blob = encode_entry([3, 1, 2], payload)
+    assert blob.startswith(b"P2MC\x01")
+    fields, out = decode_entry(blob)
+    assert fields == frozenset({1, 2, 3})
+    assert out == payload
+    # 字段号必须升序写入，保证同一集合产出同一份字节
+    assert encode_entry([3, 1, 2], payload) == encode_entry([1, 2, 3], payload)
+    assert decode_entry(b"not-an-envelope") is None
+    assert decode_entry(b"P2MC\x99") is None  # 版本不认
+
+
+ALIGNED_COLS = [
+    ("id", "int unsigned", "pb:1"),
+    ("ip", "mediumtext", "pb:2"),
+    ("port", "int unsigned", "pb:3"),
+    ("group_id", "int unsigned", "pb:4"),
+    ("player", "mediumblob", "pb:5"),
+    ("player_id", "bigint unsigned", "pb:6"),
+]
+
+
 def test_sync_creates_table_when_missing(db, conn, testpb):
-    conn.queue_rows([(0,)])  # information_schema: 表不存在
+    conn.queue_rows(
+        [(0,)],  # information_schema: 表不存在
+        [],  # CREATE 自身
+        ALIGNED_COLS,  # 建完之后回读，结构已经对齐
+        [(1,)],  # 有主键
+    )
     db.create_or_update_table(testpb.golang_test)
-    assert conn.executed[-1][0].startswith("CREATE TABLE IF NOT EXISTS `golang_test`")
+    creates = [s for s, _ in conn.executed if s.startswith("CREATE TABLE IF NOT EXISTS `golang_test`")]
+    assert len(creates) == 1
+    # 建完就对齐了，不应再发 ALTER。
+    assert not [s for s, _ in conn.executed if s.startswith("ALTER TABLE")]
+
+
+def test_sync_still_aligns_when_create_was_a_noop(db, conn, testpb):
+    """并发冷启动：CREATE TABLE IF NOT EXISTS 整条是 no-op，仍必须补列。
+
+    时序是两个版本的进程同时冷启动到空库：本进程检查时表还不存在，检查与 CREATE
+    之间另一个进程按**它自己的（较旧的）** proto 建好了表。本进程这条 CREATE
+    只会拿到一条 Warning 1050——不报错、不改结构。
+
+    早先这里建完直接 return，于是本进程独有的新列从未被添加，而进程**启动成功、
+    零异常**，一直到第一条 SELECT 才报 Error 1054 Unknown column；且表存在性缓存
+    已置 True，重启也不重新对齐，不自愈。
+    """
+    conn.queue_rows(
+        [(0,)],  # 检查时表还不存在
+        [],  # CREATE 执行（实际是 no-op，因为已被别人建走）
+        ALIGNED_COLS[:-1],  # 回读到别人建的旧结构：缺 player_id
+        [(1,)],  # 有主键
+    )
+    db.create_or_update_table(testpb.golang_test)
+    alters = [s for s, _ in conn.executed if s.startswith("ALTER TABLE")]
+    assert len(alters) == 1
+    assert "ADD COLUMN `player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:6'" in alters[0]
 
 
 def test_sync_alters_when_column_missing(db, conn, testpb):
@@ -312,8 +476,8 @@ def test_sync_alters_when_column_missing(db, conn, testpb):
         [(1,)],  # 有主键
     )
     db.create_or_update_table(testpb.golang_test)
-    alter = conn.executed[-1][0]
-    assert alter.startswith("ALTER TABLE `golang_test` ")
+    # ALTER 之后还会有一条就绪回读（TiDB 的 DDL 是异步的），所以不能假设它是最后一条
+    alter = next(s for s, _ in conn.executed if s.startswith("ALTER TABLE `golang_test` "))
     assert "MODIFY COLUMN `ip` MEDIUMTEXT COMMENT 'pb:2'" in alter
     assert "ADD COLUMN `player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:6'" in alter
 
@@ -331,3 +495,220 @@ def test_generate_migration_sql_returns_empty_when_aligned(db, conn, testpb):
         ],
     )
     assert db.generate_migration_sql(testpb.golang_test) == ""
+
+
+# ── DDL 咨询锁（P2-1） ───────────────────────────────────────────────────
+
+
+def test_sync_all_tables_takes_advisory_lock(db, conn, testpb):
+    """结构同步全程持一把 GET_LOCK，避免多副本同时 ALTER 撞 Error 1060。"""
+    conn.queue_rows(
+        [(1,)],  # GET_LOCK 返回 1
+        [(1,)],  # 表存在
+        ALIGNED_COLS,  # 结构已对齐
+        [(1,)],  # 有主键
+        [(1,)],  # 表存在（第二张表 golang_test_list）
+        [],  # 它的列（走不到实际对齐，返回空即可）
+        [(1,)],
+        [(1,)],  # RELEASE_LOCK
+    )
+    db.sync_all_tables()
+    sqls = [s for s, _ in conn.executed]
+    assert any("GET_LOCK" in s for s in sqls), "必须先抢锁"
+    assert any("RELEASE_LOCK" in s for s in sqls), "必须释放锁"
+    assert sqls.index(next(s for s in sqls if "GET_LOCK" in s)) == 0, "抢锁要在最前"
+
+
+def test_sync_degrades_when_lock_unavailable(db, conn, testpb, caplog):
+    """拿不到锁只降级 + 告警，不阻断——TiDB 等兼容实现不一定支持 GET_LOCK。
+
+    可用性比"锁一定要拿到"更重要：拿不到锁最坏是撞 Error 1060、重启自愈；
+    而因为拿不到锁就拒绝启动，是把一个并发问题升级成可用性事故。
+    """
+    conn.queue_rows(
+        [(0,)],  # GET_LOCK 返回 0 = 等超时了
+        [(1,)],  # 表存在
+        ALIGNED_COLS,
+        [(1,)],
+        [(1,)],
+        [],
+        [(1,)],
+    )
+    with caplog.at_level("WARNING", logger="proto2mysql"):
+        db.sync_all_tables()
+    assert any("未取得" in r.getMessage() for r in caplog.records)
+    # 没拿到锁就不该去释放
+    assert not any("RELEASE_LOCK" in s for s, _ in conn.executed)
+
+
+# ── 索引补齐（P2-5） ─────────────────────────────────────────────────────
+
+
+@pytest.fixture()
+def indexed_db(conn, testpb):
+    """注册一张声明了普通索引与唯一键的表。"""
+    from proto2mysql import with_indexes, with_unique_key
+
+    d = DB(conn, "testdb")
+    d.register_table(testpb.golang_test, with_indexes("player_id"), with_unique_key("ip"))
+    return d
+
+
+def test_sync_backfills_missing_indexes(indexed_db, conn, testpb):
+    """早先索引只出现在 CREATE TABLE 分支。
+
+    表一旦建成，之后在 .proto 里新加 index / unique_key **完全不生效**，且零提示——
+    查询照常能跑，只是走全表扫描，数据量上来才表现为"莫名其妙变慢"。
+    """
+    conn.queue_rows(
+        [(1,)],  # 表存在
+        ALIGNED_COLS,  # 列已对齐
+        [(1,)],  # 有主键
+        [],  # 既有索引：一个都没有
+    )
+    indexed_db.create_or_update_table(testpb.golang_test)
+    alter = next(s for s, _ in conn.executed if s.startswith("ALTER TABLE `golang_test`"))
+    assert "ADD INDEX `idx_golang_test_0` (`player_id`)" in alter
+    # ip 是 MEDIUMTEXT，索引必须带前缀长度，否则 MySQL 报 Error 1170
+    assert "ADD UNIQUE KEY `uk_golang_test` (`ip`(191))" in alter
+
+
+def test_sync_skips_existing_indexes(indexed_db, conn, testpb):
+    """线上已有的索引不重复加；线上多出来的索引也不删（可能是 DBA 手工加的）。"""
+    conn.queue_rows(
+        [(1,)],
+        ALIGNED_COLS,
+        [(1,)],
+        [("idx_golang_test_0",), ("uk_golang_test",), ("idx_dba_added_by_hand",)],
+    )
+    indexed_db.create_or_update_table(testpb.golang_test)
+    assert not [s for s, _ in conn.executed if s.startswith("ALTER TABLE")], "全都在，不该发 ALTER"
+
+
+def test_sync_skips_index_query_when_none_declared(db, conn, testpb):
+    """proto 里没声明索引时，不必去查 information_schema。"""
+    conn.queue_rows([(1,)], ALIGNED_COLS, [(1,)])
+    db.create_or_update_table(testpb.golang_test)
+    assert not [s for s, _ in conn.executed if "INFORMATION_SCHEMA.STATISTICS" in s]
+
+
+# ── TiDB 异步 DDL 就绪探测（P2-6） ───────────────────────────────────────
+
+
+def test_await_schema_visible_only_waits_for_added_columns(db):
+    """只等**本次新增的列**。
+
+    MODIFY / CHANGE 改的是已有列，回读时本来就看得见，等它们既没意义又拖长探测。
+    """
+    f = db._added_column_names
+    assert f(["ADD COLUMN `foo` bigint COMMENT 'pb:9'"]) == {"foo"}
+    assert f(["MODIFY COLUMN `ip` MEDIUMTEXT COMMENT 'pb:2'"]) == set()
+    assert f(["CHANGE COLUMN `a` `b` MEDIUMTEXT COMMENT 'pb:2'"]) == set()
+    assert f(["ADD INDEX `idx_x` (`a`)"]) == set()
+    assert f([
+        "MODIFY COLUMN `ip` MEDIUMTEXT COMMENT 'pb:2'",
+        "ADD COLUMN `bar` int COMMENT 'pb:8'",
+    ]) == {"bar"}
+
+
+def test_await_schema_visible_gives_up_on_empty_read(db, conn, testpb, monkeypatch):
+    """一列都读不到时立即放弃，不白等到 60 秒超时。
+
+    真表不可能零列，读不到说明是权限/库名的问题——继续轮询只会把启动拖满。
+    """
+    monkeypatch.setattr(DB, "SCHEMA_SETTLE_TIMEOUT", 30.0)
+    table = db.tables[testpb.golang_test.DESCRIPTOR.full_name]
+    conn.queue_rows([])  # 回读返回空
+
+    import time as _time
+
+    start = _time.monotonic()
+    db._await_schema_visible(
+        testpb.golang_test.DESCRIPTOR.full_name, table,
+        ["ADD COLUMN `foo` bigint COMMENT 'pb:9'"],
+    )
+    assert _time.monotonic() - start < 2.0, "读不到任何列时应立即返回"
+
+
+def test_sync_waits_for_added_column_to_become_visible(db, conn, testpb):
+    """ALTER 之后必须回读一次，确认新列真的可见了才放行后续 SQL。
+
+    TiDB 的 DDL 是异步 online 的：ALTER 返回时变更只是进了队列，各节点按 lease
+    （默认 45s）分批加载。不等就直接按新 proto 发 SQL，连到旧节点就报 Unknown column。
+    """
+    conn.queue_rows(
+        [(1,)],  # 表存在
+        ALIGNED_COLS[:-1],  # 缺 player_id
+        [(1,)],  # 有主键
+        [],  # ALTER 自身
+        ALIGNED_COLS,  # 就绪回读：新列可见了
+    )
+    db.create_or_update_table(testpb.golang_test)
+    col_reads = [s for s, _ in conn.executed if "INFORMATION_SCHEMA.COLUMNS" in s]
+    assert len(col_reads) == 2, "ALTER 前读一次对比、ALTER 后再读一次确认可见"
+
+
+# ── 不支持的字段类型 fail-fast（P2-4） ───────────────────────────────────
+
+
+def test_unsupported_field_kind_fails_fast_at_ddl(kitchenpb):
+    """sint32/fixed64 这类没有 MySQL 映射的类型必须在**建表时**就报错。
+
+    早先它们静默回落成 TEXT：建表一路成功，跑到第一次写入才抛异常，
+    而那时列已经建出来了、可能还上了线。
+    """
+    from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+    from proto2mysql import MessageTable
+    from proto2mysql.errors import InvalidFieldKindError
+
+    fdp = descriptor_pb2.FileDescriptorProto()
+    fdp.name = "bad_kinds_probe.proto"
+    fdp.package = "badkinds"
+    fdp.syntax = "proto3"
+    md = fdp.message_type.add()
+    md.name = "bad_kinds"
+    f1 = md.field.add()
+    f1.name, f1.number = "id", 1
+    f1.type = descriptor_pb2.FieldDescriptorProto.TYPE_INT64
+    f1.label = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
+    f2 = md.field.add()
+    f2.name, f2.number = "zigzag", 2
+    f2.type = descriptor_pb2.FieldDescriptorProto.TYPE_SINT32
+    f2.label = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
+
+    pool = descriptor_pool.DescriptorPool()
+    file_desc = pool.Add(fdp)
+    table = MessageTable.from_descriptor(file_desc.message_types_by_name["bad_kinds"])
+
+    with pytest.raises(InvalidFieldKindError) as exc:
+        table.get_create_table_sql()
+    assert "sint32" in str(exc.value), "错误信息应指出替代方案"
+
+
+# ── 表名默认值告警（P2-3） ───────────────────────────────────────────────
+
+
+def test_missing_table_name_option_warns_on_sync(db, conn, testpb, caplog):
+    """没声明 table_name 时表名退化成 proto full name（含 package）。
+
+    package 一改表名就跟着变 → 建出一张全新的空表，旧数据留在旧表里，
+    而**两边都不报错**，服务照常起来，玩家数据"凭空消失"。
+    """
+    conn.queue_rows([(1,)], [], [(1,)])
+    table = db.tables[testpb.golang_test_list.DESCRIPTOR.full_name]
+    assert table.has_explicit_table_name is False
+
+    with caplog.at_level("WARNING", logger="proto2mysql"):
+        db._sync_table_schema(testpb.golang_test_list.DESCRIPTOR.full_name, table)
+    assert any("table_name" in r.getMessage() for r in caplog.records)
+
+
+def test_explicit_table_name_does_not_warn(db, conn, testpb, caplog):
+    """声明了 table_name 就不该有噪音告警。"""
+    conn.queue_rows([(1,)], ALIGNED_COLS, [(1,)])
+    table = db.tables[testpb.golang_test.DESCRIPTOR.full_name]
+    assert table.has_explicit_table_name is True
+
+    with caplog.at_level("WARNING", logger="proto2mysql"):
+        db._sync_table_schema(testpb.golang_test.DESCRIPTOR.full_name, table)
+    assert not [r for r in caplog.records if "table_name" in r.getMessage()]

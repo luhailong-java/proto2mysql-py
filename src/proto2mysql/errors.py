@@ -73,3 +73,28 @@ class NonFiniteFloatError(Proto2MySQLError):
 
 class CacheMissError(Proto2MySQLError):
     """缓存未命中，Cache.get 实现应抛出它。对应 Go 的 ErrCacheMiss。"""
+
+
+class FieldNumberReusedError(Proto2MySQLError):
+    """线上某列的 pb:N 与新字段号相同，但两者类型跨族不可转换。
+
+    这不是改名，是**字段号被复用**：proto 里删掉一个字段后，把它的编号让给了
+    一个类型完全不同的新字段。库按字段号识别列，于是会生成
+    ``CHANGE COLUMN legacy foo bigint``——MySQL 的隐式类型转换会把 mediumtext
+    里的内容整列吃掉，而本库「永不 DROP COLUMN」的保护在这里帮不上忙。
+
+    字段号是 protobuf 的身份，**永不复用**：删字段要用 ``reserved``。
+    对应 Go 的 ErrFieldNumberReused。
+    """
+
+
+class ExpandOnlyViolationError(Proto2MySQLError):
+    """开了 expand_only 之后，本次对齐产生了非「纯新增」的变更。
+
+    滚动 / 金丝雀发布时必须打开这个开关。本库没有 schema 版本概念，每个进程都把
+    自己的 proto 当成唯一正确的目标结构，所以只要新旧两版同时在跑，
+    MODIFY / CHANGE 就会被两边**来回改**——不需要写任何数据，一次重启就翻一次面。
+    ADD COLUMN 没有这个问题：旧版本的 SQL 里根本不会出现新列名。
+
+    对应 Go 的 ErrExpandOnlyViolation。
+    """

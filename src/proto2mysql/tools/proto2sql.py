@@ -150,6 +150,25 @@ def _collect_tables(msgs: Iterable, drop: bool, seen: set[str], out: list[Table]
         _collect_tables(md.nested_types, drop, seen, out)
 
 
+#: --drop 生成物的文件头警告。
+#:
+#: 光在 CLI 帮助和函数文档里写警告是不够的——真正的风险是**生成出来的 .sql 文件被别人
+#: 拿去执行**：它看起来就是一份普通的建表脚本，``mysql < schema.sql`` 一敲，整库蒸发。
+#: 所以警告必须**跟着文件走**，谁打开都能第一眼看见。
+DROP_MODE_BANNER = """\
+-- ############################################################################
+-- ##  危险：本文件由 proto2sql --drop 生成，每张表前都有 DROP TABLE IF EXISTS
+-- ##
+-- ##  执行它会删掉这些表及其全部数据，且不可恢复。
+-- ##  仅用于空库初始化 / 测试库重建，切勿用于生产库或服务启动流程。
+-- ##
+-- ##  要在保留数据的前提下演进结构，请改用运行时库：
+-- ##      DB.generate_migration_sql()   只产出 ALTER，不删数据（推荐：交人工/CI 审核）
+-- ##      DB.sync_all_tables()          直接执行 ALTER
+-- ############################################################################
+"""
+
+
 def _build_table_sql(md, table_name: str, drop: bool) -> str:
     sql = MessageTable.from_descriptor(md).get_create_table_sql()
     if drop:
@@ -201,16 +220,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("warning: 未发现带 table_name 选项的表消息，未生成任何内容", file=sys.stderr)
         return 0
 
+    # --drop 的警告必须**跟着生成物走**：光在 CLI 帮助里写没用，
+    # 真正的风险是这份 .sql 被别人拿去 `mysql < schema.sql`。
+    banner = DROP_MODE_BANNER if args.drop else ""
+
     if args.out_dir:
         out_dir = Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         for t in tables:
             path = out_dir / f"{t.name}.sql"
-            path.write_text(t.sql + "\n", encoding="utf-8", newline="\n")
+            path.write_text(banner + t.sql + "\n", encoding="utf-8", newline="\n")
             print(f"生成表 {t.name} -> {path}")
         return 0
 
-    body = "".join(f"{t.sql}\n\n" for t in tables)
+    body = banner + "".join(f"{t.sql}\n\n" for t in tables)
     if args.output:
         Path(args.output).write_text(body, encoding="utf-8", newline="\n")
         print(f"生成 {len(tables)} 张表 -> {args.output}", file=sys.stderr)
